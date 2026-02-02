@@ -1,0 +1,9 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-pipeline"
+version = "0.1.0"
+description = "Retrieval-Augmented Generation Pipeline"
+requires-python = ">=3.8"

@@ -1,0 +1,16 @@
+faiss-cpu
+numpy
+scipy
+spacy
+torch
+sentence-transformers
+tqdm
+transformers
+peft
+tqdm
+networkx
+requests
+urllib3
+sentencepiece
+tiktoken
+protobuf

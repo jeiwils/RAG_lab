@@ -11,7 +11,7 @@ data/models/useful_sentence_lora_passages/grid/run2_hn6_rn1_pwNone_lr3e-05_ep8_r
 !data/models/useful_sentence_lora_passages/grid/run2_hn6_rn1_pwNone_lr3e-05_ep8_r8_a16_d0.05_bs16/checkpoint-epoch7/
 !data/models/useful_sentence_lora_passages/grid/run2_hn6_rn1_pwNone_lr3e-05_ep8_r8_a16_d0.05_bs16/checkpoint-epoch7/**
 data/raw_datasets/
-
+data/representations/
 
 # Python
 __pycache__/

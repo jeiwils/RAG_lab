@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 import random
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple, TypeVar
 
+from src.a1_ingestion.dataset_preprocessing_functions import split_text_into_sentences
 from src.utils.__utils__ import clean_text, load_jsonl, processed_dataset_paths
 
 __all__ = [
@@ -252,6 +254,9 @@ def build_training_examples(
     hard_negatives: int = DEFAULT_HARD_NEGATIVES,
     random_negatives: int = DEFAULT_RANDOM_NEGATIVES,
     seed: int | None = None,
+    dataset: str | None = None,
+    split: str | None = None,
+    full_passages_chunks_path: str | Path | None = None,
 ) -> List[Dict[str, Any]]:
     """Build sentence-level training examples from processed records.
 
@@ -260,6 +265,16 @@ def build_training_examples(
     sampled from passages belonging to other questions.
     """
     rng = random.Random(seed)
+    context_lookup: Dict[str, str] = {}
+    if dataset and split:
+        try:
+            context_lookup = _build_sentence_context_lookup(
+                dataset=dataset,
+                split=split,
+                full_passages_chunks_path=full_passages_chunks_path,
+            )
+        except FileNotFoundError:
+            context_lookup = {}
 
     record_ids: List[str] = []
     record_passage_pool: List[List[Dict[str, str]]] = []
@@ -280,7 +295,10 @@ def build_training_examples(
         if not question:
             continue
 
-        pos_sents = extract_supporting_fact_sentences(record)
+        passage_map = {
+            str(p.get("passage_id")): str(p.get("text", ""))
+            for p in record.get("passages", [])
+        }
         pos_ids = {str(pid) for pid in record.get("gold_passages", [])}
 
         hard_neg_sents = sample_non_supporting_sentences_same_docs(
@@ -299,23 +317,37 @@ def build_training_examples(
             exclude=pos_ids | hard_ids,
         )
 
-        for sent in pos_sents:
-            examples.append(
-                {"query": question, "sentence": sent, "label": 1, "label_type": "pos"}
-            )
-        for sent in hard_neg_sents:
+        for pid in pos_ids:
+            sent = clean_text(passage_map.get(pid, ""))
+            if not sent:
+                continue
+            context = context_lookup.get(pid, sent)
             examples.append(
                 {
                     "query": question,
+                    "context": context,
+                    "sentence": sent,
+                    "label": 1,
+                    "label_type": "pos",
+                }
+            )
+        for sent in hard_neg_sents:
+            context = context_lookup.get(sent["passage_id"], sent["text"])
+            examples.append(
+                {
+                    "query": question,
+                    "context": context,
                     "sentence": sent["text"],
                     "label": 0,
                     "label_type": "hard",
                 }
             )
         for sent in rand_neg_sents:
+            context = context_lookup.get(sent["passage_id"], sent["text"])
             examples.append(
                 {
                     "query": question,
+                    "context": context,
                     "sentence": sent["text"],
                     "label": 0,
                     "label_type": "random",
@@ -324,3 +356,39 @@ def build_training_examples(
 
     rng.shuffle(examples)
     return examples
+
+
+@lru_cache(maxsize=8)
+def _build_sentence_context_lookup(
+    *,
+    dataset: str,
+    split: str,
+    full_passages_chunks_path: str | Path | None = None,
+) -> Dict[str, str]:
+    """Map sentence-level passage IDs to their full chunk context text."""
+    if full_passages_chunks_path is None:
+        paths = processed_dataset_paths(dataset, split)
+        full_passages_chunks_path = paths["full_passages_chunks"]
+
+    chunks_by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for row in load_jsonl(str(full_passages_chunks_path)):
+        source_id = str(row.get("source_id", "")).strip()
+        if not source_id:
+            continue
+        chunks_by_source.setdefault(source_id, []).append(row)
+
+    lookup: Dict[str, str] = {}
+    for source_id, chunks in chunks_by_source.items():
+        chunks.sort(key=lambda x: int(x.get("chunk_index", 0)))
+        sent_idx = 0
+        for chunk in chunks:
+            chunk_text = clean_text(str(chunk.get("text", "")))
+            if not chunk_text:
+                continue
+            for sentence in split_text_into_sentences(chunk_text):
+                sentence_id = f"{source_id}__sent{sent_idx}"
+                if sentence_id not in lookup:
+                    lookup[sentence_id] = chunk_text
+                sent_idx += 1
+
+    return lookup

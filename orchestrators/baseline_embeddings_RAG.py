@@ -1,12 +1,11 @@
 """Module Overview
 ---------------
-Run a simple dense Retrieval-Augmented Generation (RAG) pipeline.
+Run a simple Retrieval-Augmented Generation (RAG) pipeline.
 
-This module reuses the existing FAISS indexes and embedding model to
-answer questions directly. It retrieves the
-most similar passages for each query and asks a reader model to
-produce an answer from those passages. Per-query retrieval metrics such
-as ``hits_at_k`` and ``recall_at_k`` are logged alongside the generated
+This module reuses the existing passage representations to answer questions
+directly. It supports dense, sparse, or hybrid retrieval, then asks a reader
+model to produce an answer from those passages. Per-query retrieval metrics
+such as ``hits_at_k`` and ``recall_at_k`` are logged alongside the generated
 answers.
 """
 
@@ -22,12 +21,13 @@ from typing import Any, Dict, List
 import numpy as np
 from tqdm import tqdm
 
+from src.a2_indexing.retrieval_indexing import _retrieve_chunk_indices
 from src.a3_representations.dense_representations import (
     get_embedding_model,
     load_faiss_index,
 )
-from src.b1_retrieval.dense_retrieval import faiss_search_topk
 from src.a3_representations.representations_paths import dataset_rep_paths
+from src.b1_retrieval import DEFAULT_HYBRID_ALPHA
 from src.c2_generation.answer_gen import ask_llm_with_passages
 from src.d1_evaluation.answer_metrics import (
     aggregate_answer_scores,
@@ -54,7 +54,7 @@ from src.utils.__utils__ import (
     save_jsonl,
 )
 
-__all__ = ["run_dense_rag"]
+__all__ = ["run_baseline_rag", "run_dense_rag"]
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -63,18 +63,27 @@ __all__ = ["run_dense_rag"]
 
 DEFAULT_TOP_K = 20
 DEFAULT_SEED_TOP_K = DEFAULT_TOP_K
+DEFAULT_RETRIEVER = "dense"
+ALLOWED_RETRIEVERS = {"dense", "sparse", "hybrid"}
+RETRIEVER_CONFIG = {
+    "dense": True,
+    "sparse": True,
+    "hybrid": True,
+}
+HYBRID_ALPHA = DEFAULT_HYBRID_ALPHA
 
-def run_dense_rag(
+def run_baseline_rag(
     dataset: str,
     split: str,
     reader_model: str,
-    retriever: str = "dense",
+    retriever: str = DEFAULT_RETRIEVER,
     server_url: str | None = None,
     top_k: int = DEFAULT_TOP_K,
+    alpha: float = DEFAULT_HYBRID_ALPHA,
     seed: int | None = None,
     resume: bool = False,
 ) -> Dict[str, Any]:
-    """Answer queries using dense retrieval over passages and evaluate EM/F1.
+    """Answer queries using dense/sparse/hybrid retrieval over passages and evaluate EM/F1.
 
     The function retrieves top-``k`` passages for each query and asks a reader
     model to generate an answer. Retrieval metrics ``hits_at_k`` and
@@ -92,13 +101,16 @@ def run_dense_rag(
         defaults to the first entry returned by
         :func:`src.utils.get_server_configs` for this model when ``None``.
     retriever: str, optional
-        Identifier for the passage retriever used (e.g. ``"dense"``).
+        Identifier for the passage retriever used (``"dense"``, ``"sparse"``,
+        or ``"hybrid"``).
     server_url: str, optional
         URL of the completion endpoint for ``reader_model``. When ``None``,
         the first matching server from :func:`get_server_configs` is used.
     top_k: int, optional
         Number of passages to retrieve for each query. Defaults to
         ``DEFAULT_TOP_K`` from this module.
+    alpha: float, optional
+        Weight for dense vs. sparse similarity when using hybrid retrieval.
     seed: int, optional
         Seed used to initialize :mod:`random` and :mod:`numpy` for
         deterministic behaviour.
@@ -116,6 +128,11 @@ def run_dense_rag(
         query set.
     """
 
+    if retriever not in ALLOWED_RETRIEVERS:
+        raise ValueError(
+            f"Unknown retriever '{retriever}'. Choose from {sorted(ALLOWED_RETRIEVERS)}."
+        )
+
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
@@ -126,13 +143,16 @@ def run_dense_rag(
     rep_paths = dataset_rep_paths(dataset, split)
     passages = list(load_jsonl(rep_paths["passages_jsonl"]))
     passage_lookup = {p["passage_id"]: p["text"] for p in passages}
-    index = load_faiss_index(rep_paths["passages_index"])
-    encoder = get_embedding_model()
+    index = None
+    encoder = None
+    if retriever in {"dense", "hybrid"}:
+        index = load_faiss_index(rep_paths["passages_index"])
+        encoder = get_embedding_model()
 
     query_path = processed_dataset_paths(dataset, split)["questions"]
     queries = list(load_jsonl(query_path))
 
-    variant = "dense" if seed is None else f"dense_seed{seed}"
+    variant = retriever if seed is None else f"{retriever}_seed{seed}"
     paths = get_result_paths(reader_model, dataset, split, variant)
 
     done_ids, _ = compute_resume_sets(
@@ -140,7 +160,7 @@ def run_dense_rag(
         out_path=str(paths["answers"]),
         items=queries,
         get_id=lambda q, i: q["question_id"],
-        phase_label="Dense RAG",
+        phase_label=f"Baseline RAG ({retriever})",
         id_field="question_id",
     )
     paths["base"].mkdir(parents=True, exist_ok=True)
@@ -171,8 +191,18 @@ def run_dense_rag(
 
         print(f"\n[Query] {q_id} - \"{q_text}\"")
         def _run_query():
-            q_emb = encoder.encode([q_text], normalize_embeddings=False)
-            idxs, _ = faiss_search_topk(q_emb, index, top_k=top_k)
+            query_vec = None
+            if retriever in {"dense", "hybrid"} and encoder is not None:
+                query_vec = encoder.encode([q_text], normalize_embeddings=False)
+            idxs = _retrieve_chunk_indices(
+                retriever,
+                q_text,
+                query_vec,
+                passages,
+                index,
+                top_k=top_k,
+                alpha=alpha,
+            )
             passage_ids = [passages[i]["passage_id"] for i in idxs]
             hits_val = compute_hits_at_k(passage_ids, gold_passages, top_k)
             recall_val = compute_recall_at_k(passage_ids, gold_passages, top_k)
@@ -406,6 +436,11 @@ def run_dense_rag(
     return metrics
 
 
+def run_dense_rag(*args, **kwargs) -> Dict[str, Any]:
+    """Backward-compatible alias for run_baseline_rag."""
+    return run_baseline_rag(*args, **kwargs)
+
+
 def main() -> None:
     DATASETS = ["hotpotqa", "2wikimultihopqa", "musique"]
     SPLITS = ["dev"]
@@ -431,19 +466,25 @@ def main() -> None:
         for dataset in DATASETS:
             for split in SPLITS:
                 for reader in READER_MODELS:
-                    print(
-                        f"[Dense RAG] dataset={dataset} split={split} reader={reader} top_k={TOP_K} seed={seed}"
-                    )
-                    metrics = run_dense_rag(
-                        dataset,
-                        split,
-                        reader_model=reader,
-                        top_k=TOP_K,
-                        seed=seed,
-                        resume=True,
-                    )
-                    print(metrics)
-    print("\nDense RAG complete.")
+                    for retriever, enabled in RETRIEVER_CONFIG.items():
+                        if not enabled:
+                            continue
+                        print(
+                            f"[Baseline RAG] dataset={dataset} split={split} retriever={retriever} "
+                            f"reader={reader} top_k={TOP_K} seed={seed}"
+                        )
+                        metrics = run_baseline_rag(
+                            dataset,
+                            split,
+                            reader_model=reader,
+                            retriever=retriever,
+                            top_k=TOP_K,
+                            alpha=HYBRID_ALPHA,
+                            seed=seed,
+                            resume=True,
+                        )
+                        print(metrics)
+    print("\nBaseline RAG complete.")
 
 
 if __name__ == "__main__":

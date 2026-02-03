@@ -22,9 +22,9 @@ __all__ = [
     "split_long_passage_discourse_aware_with_flags",
 ]
 
-DEFAULT_THRESHOLD = 150
+DEFAULT_THRESHOLD = 512 #### repetition? redundancy???
 DEFAULT_MIN_TOKENS = 0
-DEFAULT_MAX_TOKENS = 150
+DEFAULT_MAX_TOKENS = 512 #### repetition? redundancy???
 DEFAULT_OVERLAP = 0
 
 _TOKEN_RE = re.compile(r"\S+")

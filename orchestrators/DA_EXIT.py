@@ -59,7 +59,7 @@ from functools import lru_cache
 from datetime import datetime
 from pathlib import Path
 from statistics import median
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -68,20 +68,11 @@ from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from src.a3_representations import (
-    build_and_save_faiss_index,
-    embed_and_save,
+    dataset_rep_paths,
     get_embedding_model,
     load_faiss_index,
 )
-from src.a3_representations.sparse_representations import (
-    SPACY_MODEL,
-    add_keywords_to_passages_jsonl,
-)
-from src.a2_indexing import (
-    ChunkingConfig,
-    DiscourseAwareChunkingConfig,
-)
-from src.a2_indexing.chunking import _ensure_chunked_passages
+from src.a3_representations.sparse_representations import SPACY_MODEL
 from src.a2_indexing.retrieval_indexing import _retrieve_chunk_indices
 from src.b2_reranking.useful_sentence_extractor_lora import (
     DEFAULT_MAX_LEN,
@@ -99,7 +90,6 @@ from src.d1_evaluation.timing_metrics import compute_throughput_stats, wall_time
 from src.utils.__utils__ import (
     append_jsonl,
     compute_resume_sets,
-    existing_ids,
     get_result_paths,
     get_server_configs,
     load_jsonl,
@@ -113,56 +103,39 @@ __all__ = ["run_da_exit", "main"]
 # Config
 # ---------------------------------------------------------------------------
 
-RUN_CHUNKING = True
-RUN_INDEXING = True
-
 # Sentence usefulness cutoff (set from best_metrics.json of chosen LoRA model)
-TAU_LOW = 0.5
+TAU_LOW = 0.0
 # Total token budget for selected sentences (adjust for reader context size).
 SENTENCE_TOKEN_BUDGET = 512
+# Write a debug JSONL per question showing the reader inputs.
+WRITE_READER_DEBUG = True
 
-DATASETS = ["musique", "hotpotqa", "2wikimultihopqa"]
-SPLITS = ["dev"]
+DATASETS = ["musique", "hotpotqa", "2wikimultihopqa", "natural_questions"]
+SPLITS = ["train"]
 RETRIEVER_CONFIG = {
-    "dense": True,
     "hybrid": True,
+    "dense": True,
     "sparse": True,
 }
 
-CHUNKING_MODE = "discourse_aware"  # "standard" | "discourse_aware"
-SENTENCE_MODE = "discourse_aware"  # "standard" | "discourse_aware"
-
-STANDARD_CHUNKING_CONFIG = ChunkingConfig(
-    max_length=200,
-    overlap=30,
-    min_length=50,
-    length_unit="tokens",
-    split_on="sentence",
-    strip_whitespace=True,
-)
-
-DISCOURSE_CHUNKING_CONFIG = DiscourseAwareChunkingConfig(
-    max_length=200,
-    overlap=30,
-    min_length=50,
-    length_unit="tokens",
-    strip_whitespace=True,
-    extension_sentences=1,
-)
+# Chunking baseline.
+CHUNKING_MODE = "standard"  # "standard" | "discourse_aware"
+# Sentence mode controls post-ranking expansion for the reader context.
+# "standard" = no expansion; "discourse_aware" = expand after ranking.
+SENTENCE_MODE = "standard"  # "standard" | "discourse_aware"
 
 TOP_K_CHUNKS = 20
 TOP_K_SENTENCES = 20
 HYBRID_ALPHA = DEFAULT_HYBRID_ALPHA
 
-READER_MODEL = "deepseek-r1-distill-qwen-7b"
+IN_PROCESS_READER_LOCAL_FILES_ONLY = False
 SENTENCE_GRADER_MODEL = (
-    "data/models/useful_sentence_lora/grid/"
+    "data/models/useful_sentence_lora_passages/grid/"
     "run2_hn6_rn1_pwNone_lr3e-05_ep8_r8_a16_d0.05_bs16/checkpoint-epoch7"
 )
 SENTENCE_LORA_BATCH_SIZE = 32
 SENTENCE_LORA_MAX_LEN = DEFAULT_MAX_LEN
 SENTENCE_LORA_LOCAL_FILES_ONLY = True
-SERVER_URL = None  # If None, first server for model is used.
 
 SEED = None
 RESUME = True
@@ -172,62 +145,30 @@ SENTENCE_INCLUDE_REFORMULATION = True
 SENTENCE_INCLUDE_PARENTHETICAL = True
 SENTENCE_REQUIRE_FORWARD_PUNCT = False
 
+
+
+USE_IN_PROCESS_READER = False
+SERVER_URL = "http://localhost:8005"
+READER_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _ensure_chunk_representations(
-    chunk_paths: Dict[str, Path | str],
-    *,
-    resume: bool,
-    need_keywords: bool,
+def _load_chunk_representations(
+    rep_paths: Dict[str, str],
 ) -> Tuple[List[Dict[str, Any]], Any]:
-    if not RUN_INDEXING and not chunk_paths["chunks_meta"].exists():
-        raise FileNotFoundError(f"Missing chunk metadata: {chunk_paths['chunks_meta']}")
-    if not RUN_INDEXING and not chunk_paths["chunks_index"].exists():
-        raise FileNotFoundError(f"Missing FAISS index: {chunk_paths['chunks_index']}")
+    """Load precomputed chunk metadata and FAISS index from dataset representations."""
+    jsonl_path = Path(rep_paths["passages_jsonl"])
+    index_path = Path(rep_paths["passages_index"])
+    if not jsonl_path.exists():
+        raise FileNotFoundError(f"Missing representations JSONL: {jsonl_path}")
+    if not index_path.exists():
+        raise FileNotFoundError(f"Missing FAISS index: {index_path}")
 
-    if RUN_INDEXING:
-        encoder = get_embedding_model()
-        done_ids = None
-        if resume and chunk_paths["chunks_meta"].exists():
-            done_ids = existing_ids(
-                chunk_paths["chunks_meta"],
-                id_field="chunk_id",
-                required_field="vec_id",
-            )
-        emb_all, new_embs = embed_and_save(
-            input_jsonl=str(chunk_paths["chunks_jsonl"]),
-            output_npy=str(chunk_paths["chunks_emb"]),
-            output_jsonl=str(chunk_paths["chunks_meta"]),
-            model=encoder,
-            text_key="text",
-            id_field="chunk_id",
-            done_ids=done_ids,
-        )
-        if need_keywords:
-            add_keywords_to_passages_jsonl(str(chunk_paths["chunks_meta"]))
-
-        index_path = chunk_paths["chunks_index"]
-        if new_embs.size > 0:
-            build_and_save_faiss_index(
-                embeddings=emb_all,
-                dataset_name=str(chunk_paths["dataset_tag"]),
-                index_type="passages",
-                output_dir=str(chunk_paths["base"]),
-                new_vectors=new_embs,
-            )
-        elif not index_path.exists():
-            build_and_save_faiss_index(
-                embeddings=emb_all,
-                dataset_name=str(chunk_paths["dataset_tag"]),
-                index_type="passages",
-                output_dir=str(chunk_paths["base"]),
-            )
-
-    metadata = list(load_jsonl(str(chunk_paths["chunks_meta"])))
-    index = load_faiss_index(str(chunk_paths["chunks_index"]))
+    metadata = list(load_jsonl(str(jsonl_path)))
+    index = load_faiss_index(str(index_path))
     if index.ntotal != len(metadata):
         raise ValueError(
             "FAISS index size mismatch: "
@@ -237,12 +178,14 @@ def _ensure_chunk_representations(
 
 
 def _is_lora_checkpoint(model_name: str) -> bool:
+    """Return True if ``model_name`` points to a LoRA checkpoint directory."""
     path = Path(model_name)
     return path.is_dir() and (path / "adapter_config.json").exists()
 
 
 @lru_cache(maxsize=1)
 def _load_sentence_lora(checkpoint_dir: str):
+    """Load a LoRA sentence classifier and its tokenizer once per process."""
     ckpt = Path(checkpoint_dir)
     config_path = ckpt / "adapter_config.json"
     if not config_path.exists():
@@ -260,7 +203,10 @@ def _load_sentence_lora(checkpoint_dir: str):
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
 
     base = AutoModelForSequenceClassification.from_pretrained(
-        base_model_name, local_files_only=SENTENCE_LORA_LOCAL_FILES_ONLY
+        base_model_name,
+        num_labels=1,
+        use_safetensors=None,
+        local_files_only=SENTENCE_LORA_LOCAL_FILES_ONLY,
     )
     model = PeftModel.from_pretrained(base, str(ckpt))
     if getattr(model.config, "pad_token_id", None) is None:
@@ -280,6 +226,7 @@ def _score_sentences_lora(
     batch_size: int,
     max_length: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Score sentence candidates with the LoRA classifier and return token stats."""
     totals = {
         "sentence_prompt_tokens": 0,
         "sentence_output_tokens": 0,
@@ -297,6 +244,7 @@ def _score_sentences_lora(
         batch = [
             {
                 "query": question,
+                "context": str(item.get("context", item.get("text", ""))),
                 "sentence": str(item.get("text", "")),
                 "label": 0,
             }
@@ -360,40 +308,19 @@ def run_da_exit(
             "SENTENCE_GRADER_MODEL must be a LoRA checkpoint path with adapter_config.json. "
             f"Got: {sentence_model}"
         )
-    if server_url is None:
+    if not USE_IN_PROCESS_READER and server_url is None:
         server_url = get_server_configs(reader_model)[0]["server_url"]
 
     processed_paths = processed_dataset_paths(dataset, split)
-    if FULL_PASSAGES_CHUNK_VARIANT == "standard":
-        chunk_key = "full_passages_chunks"
-    elif FULL_PASSAGES_CHUNK_VARIANT == "discourse_aware":
-        chunk_key = "full_passages_chunks_discourse_aware"
+    if chunking_mode == "standard":
+        passage_source = "full_passages_chunks"
+    elif chunking_mode == "discourse_aware":
+        passage_source = "full_passages_chunks_discourse_aware"
     else:
-        raise ValueError(
-            "FULL_PASSAGES_CHUNK_VARIANT must be 'standard' or 'discourse_aware'"
-        )
-    passages_path = processed_paths[chunk_key]
-    if not passages_path.exists():
-        raise FileNotFoundError(
-            f"Missing {passages_path.name} for {dataset}/{split}: {passages_path}"
-        )
+        raise ValueError("chunking_mode must be 'standard' or 'discourse_aware'")
 
-    need_keywords = retriever in {"hybrid", "sparse"}
-    chunk_paths = _ensure_chunked_passages(
-        dataset,
-        split,
-        chunking_mode=chunking_mode,
-        resume=resume,
-        run_chunking=RUN_CHUNKING,
-        standard_config=STANDARD_CHUNKING_CONFIG,
-        discourse_config=DISCOURSE_CHUNKING_CONFIG,
-        passages_path=passages_path,
-    )
-    metadata, index = _ensure_chunk_representations(
-        chunk_paths,
-        resume=resume,
-        need_keywords=need_keywords,
-    )
+    rep_paths = dataset_rep_paths(dataset, split, passage_source=passage_source)
+    metadata, index = _load_chunk_representations(rep_paths)
     encoder = get_embedding_model() if retriever in {"dense", "hybrid"} else None
 
     questions_path = processed_paths["questions"]
@@ -402,10 +329,13 @@ def run_da_exit(
     variant = f"da_exit_{chunking_mode}_{retriever}_k{top_k_chunks}_s{top_k_sentences}"
     paths = get_result_paths(reader_model, dataset, split, variant)
     paths["base"].mkdir(parents=True, exist_ok=True)
+    debug_path = paths["base"] / f"reader_debug_{variant}_{split}.jsonl"
     if not resume and paths["answers"].exists():
         paths["answers"].unlink()
     if not resume and paths["answer_metrics"].exists():
         paths["answer_metrics"].unlink()
+    if WRITE_READER_DEBUG and not resume and debug_path.exists():
+        debug_path.unlink()
 
     done_ids, _ = compute_resume_sets(
         resume=resume,
@@ -439,6 +369,7 @@ def run_da_exit(
         gold[q_id] = [q.get("gold_answer", "")]
 
         def _run_query():
+            """Execute retrieval, sentence scoring, and reader inference for one query."""
             query_vec = None
             if retriever in {"dense", "hybrid"} and encoder is not None:
                 query_vec = encoder.encode([q_text], normalize_embeddings=False)
@@ -454,21 +385,94 @@ def run_da_exit(
 
             chunks = [metadata[i] for i in chunk_idxs]
             sentences: List[Dict[str, Any]] = []
+            expanded_by_id: Dict[str, Dict[str, Any]] = {}
+            chunk_ids: List[str] = []
+            expand_after = SENTENCE_MODE == "discourse_aware"
             for chunk in chunks:
                 chunk_id = chunk.get("chunk_id", chunk.get("passage_id", "chunk"))
+                chunk_ids.append(chunk_id)
                 sentences.extend(
                     _build_sentence_candidates(
                         chunk.get("text", ""),
                         chunk_id,
-                        mode=SENTENCE_MODE,
+                        mode="standard",
                         extension=SENTENCE_EXTENSION,
                         include_reformulation=SENTENCE_INCLUDE_REFORMULATION,
                         include_parenthetical=SENTENCE_INCLUDE_PARENTHETICAL,
                         require_forward_punct=SENTENCE_REQUIRE_FORWARD_PUNCT,
                     )
                 )
+                if expand_after:
+                    expanded = _build_sentence_candidates(
+                        chunk.get("text", ""),
+                        chunk_id,
+                        mode="discourse_aware",
+                        extension=SENTENCE_EXTENSION,
+                        include_reformulation=SENTENCE_INCLUDE_REFORMULATION,
+                        include_parenthetical=SENTENCE_INCLUDE_PARENTHETICAL,
+                        require_forward_punct=SENTENCE_REQUIRE_FORWARD_PUNCT,
+                    )
+                    for item in expanded:
+                        expanded_by_id[item["sentence_id"]] = item
+
+            def _write_reader_debug(
+                selected_sentences: List[Dict[str, Any]],
+                reason: Optional[str] = None,
+                n_candidates: Optional[int] = None,
+                n_ranked: Optional[int] = None,
+                n_filtered: Optional[int] = None,
+            ) -> None:
+                if not WRITE_READER_DEBUG:
+                    return
+                payload = {
+                    "dataset": dataset,
+                    "split": split,
+                    "variant": variant,
+                    "retriever": retriever,
+                    "chunking_mode": chunking_mode,
+                    "sentence_mode": SENTENCE_MODE,
+                    "expand_after_rerank": expand_after,
+                    "reader_model": reader_model,
+                    "question_id": q_id,
+                    "question": q_text,
+                    "tau_low": TAU_LOW,
+                    "token_budget": SENTENCE_TOKEN_BUDGET,
+                    "top_k_chunks": top_k_chunks,
+                    "top_k_sentences": top_k_sentences,
+                    "retrieved_chunk_count": len(chunk_ids),
+                    "retrieved_chunk_ids": chunk_ids,
+                    "n_selected": len(selected_sentences),
+                    "selected_sentences": [
+                        {
+                            "sentence_id": s["sentence_id"],
+                            "chunk_id": s["chunk_id"],
+                            "sent_idx": s["sent_idx"],
+                            "span_start": s.get("span_start", s["sent_idx"]),
+                            "span_end": s.get("span_end", s["sent_idx"]),
+                            "expanded": s.get("expanded", False),
+                            "score": s.get("score", 0.0),
+                            "score_normalized": s.get("score_normalized", 0.0),
+                            "text": s.get("text", ""),
+                        }
+                        for s in selected_sentences
+                    ],
+                }
+                if reason is not None:
+                    payload["reason"] = reason
+                if n_candidates is not None:
+                    payload["n_candidates"] = n_candidates
+                if n_ranked is not None:
+                    payload["n_ranked"] = n_ranked
+                if n_filtered is not None:
+                    payload["n_filtered"] = n_filtered
+                append_jsonl(str(debug_path), payload)
 
             if not sentences:
+                _write_reader_debug(
+                    [],
+                    reason="no_candidates",
+                    n_candidates=0,
+                )
                 return {
                     "selected_sentences": [],
                     "answer": {
@@ -506,7 +510,38 @@ def run_da_exit(
                 tau_low=TAU_LOW,
             )
             selected = filtered[:top_k_sentences]
+            if expand_after:
+                expanded_selected: List[Dict[str, Any]] = []
+                for s in selected:
+                    expanded = expanded_by_id.get(s["sentence_id"])
+                    if expanded is None:
+                        expanded_selected.append(s)
+                        continue
+                    merged = dict(s)
+                    merged["text"] = expanded.get("text", s.get("text", ""))
+                    merged["span_start"] = expanded.get(
+                        "span_start", s.get("span_start", s["sent_idx"])
+                    )
+                    merged["span_end"] = expanded.get(
+                        "span_end", s.get("span_end", s["sent_idx"])
+                    )
+                    merged["expanded"] = expanded.get("expanded", False)
+                    expanded_selected.append(merged)
+                # Re-apply token budget after expansion, preserving rank order.
+                expanded_selected = select_ranked_sentences(
+                    expanded_selected,
+                    token_budget=SENTENCE_TOKEN_BUDGET,
+                    tau_low=None,
+                )
+                selected = expanded_selected[:top_k_sentences]
             if not selected:
+                _write_reader_debug(
+                    [],
+                    reason="no_selected",
+                    n_candidates=len(sentences),
+                    n_ranked=len(ranked),
+                    n_filtered=len(filtered),
+                )
                 return {
                     "selected_sentences": [],
                     "answer": {
@@ -524,6 +559,12 @@ def run_da_exit(
             sentence_ids = list(sentence_lookup.keys())
 
             """Sent to reader: the ordered selected list is passed through ask_llm_with_passages in that same order."""
+            _write_reader_debug(
+                selected,
+                n_candidates=len(sentences),
+                n_ranked=len(ranked),
+                n_filtered=len(filtered),
+            )
             answer = ask_llm_with_passages(
                 query_text=q_text,
                 passage_ids=sentence_ids,
@@ -533,6 +574,8 @@ def run_da_exit(
                 model_name=reader_model,
                 top_k_answer_passages=len(sentence_ids),
                 seed=seed,
+                in_process=USE_IN_PROCESS_READER,
+                local_files_only=IN_PROCESS_READER_LOCAL_FILES_ONLY,
             )
 
             return {
@@ -689,8 +732,8 @@ def run_da_exit(
 def main() -> None:
     """Entry point for the DA_EXIT orchestrator.
 
-    Expects processed datasets under data/processed_datasets and uses the
-    configured chunk file (standard or discourse-aware).
+    Expects processed datasets under data/processed_datasets and precomputed
+    chunk representations under data/representations/datasets.
     """
     if RETRIEVER_CONFIG.get("hybrid") or RETRIEVER_CONFIG.get("sparse"):
         print(f"[spaCy] Using: {SPACY_MODEL}")

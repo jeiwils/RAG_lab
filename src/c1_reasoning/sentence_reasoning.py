@@ -256,6 +256,7 @@ def _build_sentence_candidates(
                     "span_start": sent_idx,
                     "span_end": sent_idx,
                     "expanded": False,
+                    "context": chunk_text,
                     "text": sent,
                 }
             )
@@ -292,6 +293,7 @@ def _build_sentence_candidates(
                 "span_start": span_start,
                 "span_end": span_end,
                 "expanded": span_start != span_end,
+                "context": chunk_text,
                 "text": expanded_text,
             }
         )

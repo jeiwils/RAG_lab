@@ -67,7 +67,16 @@ DEFAULT_WARMUP = 200
 DEFAULT_MAX_GRAD_NORM = 1.0
 
 
-DEFAULT_TEXT_TEMPLATE = "Question: {query}\nSentence: {sentence}"
+DEFAULT_TEXT_TEMPLATE = (
+    "Query:\n"
+    "{query}\n"
+    "Full context:\n"
+    "{context}\n"
+    "Sentence:\n"
+    "{sentence}\n"
+    "Is this sentence useful in answering the\n"
+    "query? Answer only \"Yes\" or \"No\""
+)
 
 # Script-level defaults when running this file directly.
 DEFAULT_DATASET = "hotpotqa"
@@ -108,9 +117,13 @@ def encode_batch(
     texts: List[str] = []
     labels: List[int] = []
     for ex in batch:
+        sentence = str(ex.get("sentence", ""))
+        context = str(ex.get("context", sentence))
         texts.append(
             text_template.format(
-                query=str(ex.get("query", "")), sentence=str(ex.get("sentence", ""))
+                query=str(ex.get("query", "")),
+                context=context,
+                sentence=sentence,
             )
         )
         labels.append(int(ex.get("label", 0)))
@@ -267,12 +280,16 @@ def train(
         hard_negatives=hard_negatives,
         random_negatives=random_negatives,
         seed=seed,
+        dataset=dataset,
+        split=train_split,
     )
     dev_examples = build_training_examples(
         dev_data,
         hard_negatives=hard_negatives,
         random_negatives=random_negatives,
         seed=seed,
+        dataset=dataset,
+        split=dev_split,
     )
 
     if pos_weight is None:

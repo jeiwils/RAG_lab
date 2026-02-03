@@ -32,21 +32,30 @@ def main() -> None:
     bge_model = get_embedding_model()
 
     # Config
-    DATASETS = ["musique", "hotpotqa", "2wikimultihopqa"]
-    SPLIT = "dev"
+    DATASETS = ["musique", "hotpotqa", "2wikimultihopqa", "natural_questions"]
+    SPLIT = "train"
+    # Must match a key from processed_dataset_paths (e.g., passages, full_passages,
+    # passages_discourse_aware, full_passages_chunks, full_passages_chunks_discourse_aware).
+    PASSAGE_SOURCE = "full_passages_chunks"
 
     # -------------------------------
     # Phase A: Passages (Dataset-only)
     # -------------------------------
     for dataset in DATASETS:
-        print(f"\n=== DATASET: {dataset} ({SPLIT}) ===")
+        print(f"\n=== DATASET: {dataset} ({SPLIT}) [{PASSAGE_SOURCE}] ===")
 
         # File paths
-        pass_paths = dataset_rep_paths(dataset, SPLIT)
+        pass_paths = dataset_rep_paths(dataset, SPLIT, passage_source=PASSAGE_SOURCE)
         dataset_dir = Path(os.path.dirname(pass_paths["passages_jsonl"]))
         os.makedirs(dataset_dir, exist_ok=True)
 
-        passages_jsonl_src = str(processed_dataset_paths(dataset, SPLIT)["passages"])
+        source_paths = processed_dataset_paths(dataset, SPLIT)
+        if PASSAGE_SOURCE not in source_paths:
+            raise KeyError(
+                f"Unknown PASSAGE_SOURCE '{PASSAGE_SOURCE}'. "
+                f"Available keys: {sorted(source_paths.keys())}"
+            )
+        passages_jsonl_src = str(source_paths[PASSAGE_SOURCE])
         passages_jsonl = pass_paths["passages_jsonl"]
         passages_npy = pass_paths["passages_emb"]
 

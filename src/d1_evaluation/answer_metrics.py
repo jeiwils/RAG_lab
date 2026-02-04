@@ -71,7 +71,7 @@ def evaluate_answers(
 
 
 def aggregate_answer_scores(predictions: dict, gold_answers: dict) -> dict:
-    """Aggregate EM and F1 over a set of predicted answers."""
+    """Aggregate EM and F1 over a set of predicted answers (means in %)."""
     total = len(gold_answers)
     em_total = 0
     f1_total = 0.0
@@ -84,6 +84,6 @@ def aggregate_answer_scores(predictions: dict, gold_answers: dict) -> dict:
         f1_total += f1
 
     return {
-        "EM": 100.0 * em_total / total,
-        "F1": 100.0 * f1_total / total,
+        "mean_em": 100.0 * em_total / total,
+        "mean_f1": 100.0 * f1_total / total,
     }

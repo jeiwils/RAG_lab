@@ -13,17 +13,24 @@ from src.utils.algorithms.discourse_aware import (
 )
 from src.utils.x_config import LLM_DEFAULTS, MAX_TOKENS, TEMPERATURE
 from src.utils.z_llm_utils import is_r1_like, query_llm, strip_think
+from src.d1_evaluation.retrieval_metrics import compute_hits_at_k, compute_recall_at_k
 
 __all__ = [
     "DEFAULT_SENTENCE_EVAL_PROMPT",
     "build_sentence_evaluation_prompt",
     "evaluate_sentence_usefulness",
+    "extract_passage_ids_from_sentences",
+    "compute_passage_hits_recall_at_k",
     "split_chunk_sentences",
     "_score_sentences",
     "_build_sentence_candidates",
     "_select_top_sentences",
     "_filter_sentences_by_threshold",
 ]
+
+
+_SENT_SUFFIX_RE = re.compile(r"__sent\d+$")
+_CHUNK_SUFFIX_RE = re.compile(r"__chunk\d+$")
 
 
 DEFAULT_SENTENCE_EVAL_PROMPT = (
@@ -62,6 +69,51 @@ def split_chunk_sentences(text: str) -> List[str]:
         if cleaned:
             sentences.append(cleaned)
     return sentences
+
+
+def _normalize_passage_id(value: str) -> str:
+    """Normalize a sentence/chunk identifier to a passage-level id."""
+    base = _SENT_SUFFIX_RE.sub("", value)
+    base = _CHUNK_SUFFIX_RE.sub("", base)
+    return base
+
+
+def extract_passage_ids_from_sentences(
+    selected_sentences: Sequence[Dict[str, Any]] | Sequence[str],
+) -> List[str]:
+    """Return ordered, de-duplicated passage ids from selected sentences."""
+    passage_ids: List[str] = []
+    seen = set()
+    for item in selected_sentences:
+        raw_id = ""
+        if isinstance(item, dict):
+            raw_id = str(item.get("chunk_id") or item.get("sentence_id") or "")
+        else:
+            raw_id = str(item)
+        if not raw_id:
+            continue
+        pid = _normalize_passage_id(raw_id)
+        if pid and pid not in seen:
+            seen.add(pid)
+            passage_ids.append(pid)
+    return passage_ids
+
+
+def compute_passage_hits_recall_at_k(
+    selected_sentences: Sequence[Dict[str, Any]] | Sequence[str],
+    gold_passages: Sequence[str],
+    *,
+    k: int,
+) -> Dict[str, float]:
+    """Compute hits@k and recall@k over passage ids implied by sentences."""
+    passage_ids = extract_passage_ids_from_sentences(selected_sentences)
+    hits = compute_hits_at_k(passage_ids, list(gold_passages), k)
+    recall = compute_recall_at_k(passage_ids, list(gold_passages), k)
+    return {
+        "hits_at_k_ratio": float(hits),
+        "recall_at_k_ratio": float(recall),
+        "passage_count": float(len(passage_ids)),
+    }
 
 
 def _validate_scale(scale: Tuple[int, int]) -> Tuple[int, int]:

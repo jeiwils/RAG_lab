@@ -38,10 +38,10 @@ def summarize_reader_wall_times(
     call_latency_ms = t_reader_ms / max(n_reader_calls, 1)
 
     return {
-        "reader_wall_time_total_sec": total_sec,
-        "reader_wall_time_mean_sec": mean_sec,
-        "reader_wall_time_median_sec": median_sec,
-        "t_reader_ms": t_reader_ms,
+        "reader_wall_time_sec_total": total_sec,
+        "reader_wall_time_sec_mean": mean_sec,
+        "reader_wall_time_sec_median": median_sec,
+        "reader_time_ms_total": t_reader_ms,
         "query_latency_ms": query_latency_ms,
         "call_latency_ms": call_latency_ms,
     }
@@ -62,12 +62,12 @@ def compute_throughput_stats(
     num_queries = float(num_queries or 0.0)
     n_reader_calls = float(n_reader_calls or 0.0)
 
-    tps_overall = tokens_total / (t_total_ms / 1000) if t_total_ms else 0.0
-    query_qps_reader = num_queries / (t_reader_ms / 1000) if t_reader_ms else 0.0
-    cps_reader = n_reader_calls / (t_reader_ms / 1000) if t_reader_ms else 0.0
+    tokens_per_sec = tokens_total / (t_total_ms / 1000) if t_total_ms else 0.0
+    queries_per_sec = num_queries / (t_reader_ms / 1000) if t_reader_ms else 0.0
+    calls_per_sec = n_reader_calls / (t_reader_ms / 1000) if t_reader_ms else 0.0
 
     return {
-        "tps_overall": tps_overall,
-        "query_qps_reader": query_qps_reader,
-        "cps_reader": cps_reader,
+        "tokens_per_sec": tokens_per_sec,
+        "queries_per_sec": queries_per_sec,
+        "calls_per_sec": calls_per_sec,
     }

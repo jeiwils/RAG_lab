@@ -83,6 +83,7 @@ from src.b1_retrieval import DEFAULT_HYBRID_ALPHA
 from src.c1_reasoning.sentence_reasoning import (
     _build_sentence_candidates,
     _select_top_sentences,
+    compute_passage_hits_recall_at_k,
 )
 from src.c2_generation.answer_gen import ask_llm_with_passages
 from src.d1_evaluation.answer_metrics import aggregate_answer_scores, evaluate_answers
@@ -104,48 +105,43 @@ __all__ = ["run_da_exit", "main"]
 # ---------------------------------------------------------------------------
 
 # Sentence usefulness cutoff (set from best_metrics.json of chosen LoRA model)
-TAU_LOW = 0.0
+TAU_LOW = 0.58
 # Total token budget for selected sentences (adjust for reader context size).
-SENTENCE_TOKEN_BUDGET = 512
-# Write a debug JSONL per question showing the reader inputs.
-WRITE_READER_DEBUG = True
 
 DATASETS = ["musique", "hotpotqa", "2wikimultihopqa", "natural_questions"]
 SPLITS = ["train"]
 RETRIEVER_CONFIG = {
     "hybrid": True,
-    "dense": True,
-    "sparse": True,
+    "dense": False,
+    "sparse": False,
 }
 
 # Chunking baseline.
-CHUNKING_MODE = "standard"  # "standard" | "discourse_aware"
+CHUNKING_MODE = "standard_chunks"  # "standard_chunks" | "discourse_aware_chunks"
 # Sentence mode controls post-ranking expansion for the reader context.
-# "standard" = no expansion; "discourse_aware" = expand after ranking.
-SENTENCE_MODE = "standard"  # "standard" | "discourse_aware"
+# "standard_sentences" = no expansion; "discourse_aware_sentences" = expand after ranking.
+SENTENCE_MODE = "discourse_aware_sentences"  # "standard_sentences" | "discourse_aware_sentences"
 
-TOP_K_CHUNKS = 20
-TOP_K_SENTENCES = 20
-HYBRID_ALPHA = DEFAULT_HYBRID_ALPHA
 
-IN_PROCESS_READER_LOCAL_FILES_ONLY = False
+SENTENCE_TOKEN_BUDGET = 512
+TOP_K_CHUNK_SWEEP = [1, 5, 10, 20]
+HYBRID_ALPHA = DEFAULT_HYBRID_ALPHA ## ????
+
+IN_PROCESS_READER_LOCAL_FILES_ONLY = True
 SENTENCE_GRADER_MODEL = (
-    "data/models/useful_sentence_lora_passages/grid/"
-    "run2_hn6_rn1_pwNone_lr3e-05_ep8_r8_a16_d0.05_bs16/checkpoint-epoch7"
+    "data/models/useful_sentence_lora/grid/"
+    "run4_hn6_rn1_pw2.0_lr3e-05_ep8_r8_a16_d0.05_bs16/checkpoint-epoch8"
 )
 SENTENCE_LORA_BATCH_SIZE = 32
 SENTENCE_LORA_MAX_LEN = DEFAULT_MAX_LEN
 SENTENCE_LORA_LOCAL_FILES_ONLY = True
 
-SEED = None
+SEEDS = [1] #[1, 2, 3]
 RESUME = True
 
-SENTENCE_EXTENSION = 1
-SENTENCE_INCLUDE_REFORMULATION = True
-SENTENCE_INCLUDE_PARENTHETICAL = True
-SENTENCE_REQUIRE_FORWARD_PUNCT = False
-
-
+# Debug logging of ranked candidates (can be large).
+LOG_RANKED_CANDIDATES = True
+RANKED_CANDIDATES_LIMIT: int | None = 200
 
 USE_IN_PROCESS_READER = False
 SERVER_URL = "http://localhost:8005"
@@ -293,7 +289,6 @@ def run_da_exit(
     sentence_model: str,
     server_url: str | None,
     top_k_chunks: int,
-    top_k_sentences: int,
     chunking_mode: str,
     seed: int | None,
     resume: bool,
@@ -302,6 +297,15 @@ def run_da_exit(
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True)
+        except AttributeError:
+            pass
 
     if not _is_lora_checkpoint(sentence_model):
         raise ValueError(
@@ -312,12 +316,14 @@ def run_da_exit(
         server_url = get_server_configs(reader_model)[0]["server_url"]
 
     processed_paths = processed_dataset_paths(dataset, split)
-    if chunking_mode == "standard":
+    if chunking_mode == "standard_chunks":
         passage_source = "full_passages_chunks"
-    elif chunking_mode == "discourse_aware":
+    elif chunking_mode == "discourse_aware_chunks":
         passage_source = "full_passages_chunks_discourse_aware"
     else:
-        raise ValueError("chunking_mode must be 'standard' or 'discourse_aware'")
+        raise ValueError(
+            "chunking_mode must be 'standard_chunks' or 'discourse_aware_chunks'"
+        )
 
     rep_paths = dataset_rep_paths(dataset, split, passage_source=passage_source)
     metadata, index = _load_chunk_representations(rep_paths)
@@ -326,7 +332,9 @@ def run_da_exit(
     questions_path = processed_paths["questions"]
     questions = list(load_jsonl(str(questions_path)))
 
-    variant = f"da_exit_{chunking_mode}_{retriever}_k{top_k_chunks}_s{top_k_sentences}"
+    variant = f"da_exit_{chunking_mode}_{SENTENCE_MODE}_{retriever}_k{top_k_chunks}"
+    if seed is not None:
+        variant = f"{variant}_seed{seed}"
     paths = get_result_paths(reader_model, dataset, split, variant)
     paths["base"].mkdir(parents=True, exist_ok=True)
     debug_path = paths["base"] / f"reader_debug_{variant}_{split}.jsonl"
@@ -334,7 +342,7 @@ def run_da_exit(
         paths["answers"].unlink()
     if not resume and paths["answer_metrics"].exists():
         paths["answer_metrics"].unlink()
-    if WRITE_READER_DEBUG and not resume and debug_path.exists():
+    if not resume and debug_path.exists():
         debug_path.unlink()
 
     done_ids, _ = compute_resume_sets(
@@ -360,6 +368,8 @@ def run_da_exit(
         "n_sentence_calls": 0,
         "n_reader_calls": 0,
     }
+    hits_at_k_scores: List[float] = []
+    recall_at_k_scores: List[float] = []
 
     for q in tqdm(questions, desc=f"{dataset}/{split}/{retriever}"):
         q_id = q["question_id"]
@@ -387,7 +397,7 @@ def run_da_exit(
             sentences: List[Dict[str, Any]] = []
             expanded_by_id: Dict[str, Dict[str, Any]] = {}
             chunk_ids: List[str] = []
-            expand_after = SENTENCE_MODE == "discourse_aware"
+            expand_after = SENTENCE_MODE == "discourse_aware_sentences"
             for chunk in chunks:
                 chunk_id = chunk.get("chunk_id", chunk.get("passage_id", "chunk"))
                 chunk_ids.append(chunk_id)
@@ -396,10 +406,10 @@ def run_da_exit(
                         chunk.get("text", ""),
                         chunk_id,
                         mode="standard",
-                        extension=SENTENCE_EXTENSION,
-                        include_reformulation=SENTENCE_INCLUDE_REFORMULATION,
-                        include_parenthetical=SENTENCE_INCLUDE_PARENTHETICAL,
-                        require_forward_punct=SENTENCE_REQUIRE_FORWARD_PUNCT,
+                        extension=1,
+                        include_reformulation=True,
+                        include_parenthetical=True,
+                        require_forward_punct=False,
                     )
                 )
                 if expand_after:
@@ -407,10 +417,10 @@ def run_da_exit(
                         chunk.get("text", ""),
                         chunk_id,
                         mode="discourse_aware",
-                        extension=SENTENCE_EXTENSION,
-                        include_reformulation=SENTENCE_INCLUDE_REFORMULATION,
-                        include_parenthetical=SENTENCE_INCLUDE_PARENTHETICAL,
-                        require_forward_punct=SENTENCE_REQUIRE_FORWARD_PUNCT,
+                        extension=1,
+                        include_reformulation=True,
+                        include_parenthetical=True,
+                        require_forward_punct=False,
                     )
                     for item in expanded:
                         expanded_by_id[item["sentence_id"]] = item
@@ -421,9 +431,22 @@ def run_da_exit(
                 n_candidates: Optional[int] = None,
                 n_ranked: Optional[int] = None,
                 n_filtered: Optional[int] = None,
+                ranked_sentences: Optional[List[Dict[str, Any]]] = None,
+                ranked_truncated: Optional[bool] = None,
             ) -> None:
-                if not WRITE_READER_DEBUG:
-                    return
+                def _pack_sentence(s: Dict[str, Any]) -> Dict[str, Any]:
+                    return {
+                        "sentence_id": s.get("sentence_id"),
+                        "chunk_id": s.get("chunk_id"),
+                        "sent_idx": s.get("sent_idx"),
+                        "span_start": s.get("span_start", s.get("sent_idx")),
+                        "span_end": s.get("span_end", s.get("sent_idx")),
+                        "expanded": s.get("expanded", False),
+                        "score": s.get("score", 0.0),
+                        "score_normalized": s.get("score_normalized", 0.0),
+                        "text": s.get("text", ""),
+                    }
+
                 payload = {
                     "dataset": dataset,
                     "split": split,
@@ -438,24 +461,10 @@ def run_da_exit(
                     "tau_low": TAU_LOW,
                     "token_budget": SENTENCE_TOKEN_BUDGET,
                     "top_k_chunks": top_k_chunks,
-                    "top_k_sentences": top_k_sentences,
                     "retrieved_chunk_count": len(chunk_ids),
                     "retrieved_chunk_ids": chunk_ids,
                     "n_selected": len(selected_sentences),
-                    "selected_sentences": [
-                        {
-                            "sentence_id": s["sentence_id"],
-                            "chunk_id": s["chunk_id"],
-                            "sent_idx": s["sent_idx"],
-                            "span_start": s.get("span_start", s["sent_idx"]),
-                            "span_end": s.get("span_end", s["sent_idx"]),
-                            "expanded": s.get("expanded", False),
-                            "score": s.get("score", 0.0),
-                            "score_normalized": s.get("score_normalized", 0.0),
-                            "text": s.get("text", ""),
-                        }
-                        for s in selected_sentences
-                    ],
+                    "selected_sentences": [_pack_sentence(s) for s in selected_sentences],
                 }
                 if reason is not None:
                     payload["reason"] = reason
@@ -465,6 +474,12 @@ def run_da_exit(
                     payload["n_ranked"] = n_ranked
                 if n_filtered is not None:
                     payload["n_filtered"] = n_filtered
+                if LOG_RANKED_CANDIDATES and ranked_sentences is not None:
+                    payload["ranked_sentences"] = [
+                        _pack_sentence(s) for s in ranked_sentences
+                    ]
+                    payload["ranked_truncated"] = bool(ranked_truncated)
+                    payload["ranked_limit"] = RANKED_CANDIDATES_LIMIT
                 append_jsonl(str(debug_path), payload)
 
             if not sentences:
@@ -503,13 +518,23 @@ def run_da_exit(
             """Ranking: _select_top_sentences(scored, top_k=len(scored)) sorts by score (highest first)."""
             ranked = _select_top_sentences(scored, top_k=len(scored))
 
+            ranked_for_debug: Optional[List[Dict[str, Any]]] = None
+            ranked_truncated = None
+            if LOG_RANKED_CANDIDATES:
+                if RANKED_CANDIDATES_LIMIT is None:
+                    ranked_for_debug = ranked
+                    ranked_truncated = False
+                else:
+                    ranked_for_debug = ranked[:RANKED_CANDIDATES_LIMIT]
+                    ranked_truncated = len(ranked) > RANKED_CANDIDATES_LIMIT
+
             """Repackaging with tau + budget: select_ranked_sentences(..., tau_low=TAU_LOW, token_budget=SENTENCE_TOKEN_BUDGET) keeps only above tau and within the budget, preserving rank order."""
             filtered = select_ranked_sentences(
                 ranked,
                 token_budget=SENTENCE_TOKEN_BUDGET,
                 tau_low=TAU_LOW,
             )
-            selected = filtered[:top_k_sentences]
+            selected = filtered
             if expand_after:
                 expanded_selected: List[Dict[str, Any]] = []
                 for s in selected:
@@ -533,7 +558,7 @@ def run_da_exit(
                     token_budget=SENTENCE_TOKEN_BUDGET,
                     tau_low=None,
                 )
-                selected = expanded_selected[:top_k_sentences]
+                selected = expanded_selected
             if not selected:
                 _write_reader_debug(
                     [],
@@ -541,6 +566,8 @@ def run_da_exit(
                     n_candidates=len(sentences),
                     n_ranked=len(ranked),
                     n_filtered=len(filtered),
+                    ranked_sentences=ranked_for_debug,
+                    ranked_truncated=ranked_truncated,
                 )
                 return {
                     "selected_sentences": [],
@@ -564,6 +591,8 @@ def run_da_exit(
                 n_candidates=len(sentences),
                 n_ranked=len(ranked),
                 n_filtered=len(filtered),
+                ranked_sentences=ranked_for_debug,
+                ranked_truncated=ranked_truncated,
             )
             answer = ask_llm_with_passages(
                 query_text=q_text,
@@ -606,6 +635,16 @@ def run_da_exit(
         token_totals["reader_output_tokens"] += answer.get("output_tokens", 0)
         token_totals["reader_total_tokens"] += answer.get("total_tokens", 0)
         token_totals["n_reader_calls"] += 1
+
+        gold_passages = q.get("gold_passages_full") or q.get("gold_passages") or []
+        if gold_passages:
+            passage_metrics = compute_passage_hits_recall_at_k(
+                selected_sentences,
+                gold_passages,
+                k=top_k_chunks,
+            )
+            hits_at_k_scores.append(passage_metrics["hits_at_k_ratio"])
+            recall_at_k_scores.append(passage_metrics["recall_at_k_ratio"])
 
         append_jsonl(
             str(paths["answers"]),
@@ -681,49 +720,98 @@ def run_da_exit(
     else:
         save_jsonl(str(paths["answer_metrics"]), metric_records)
 
-    wall_time_total_sec = sum(wall_times)
-    wall_time_mean_sec = (
-        wall_time_total_sec / len(wall_times) if wall_times else 0.0
+    wall_time_sec_total = sum(wall_times)
+    wall_time_sec_mean = (
+        wall_time_sec_total / len(wall_times) if wall_times else 0.0
     )
-    wall_time_median_sec = median(wall_times) if wall_times else 0.0
+    wall_time_sec_median = median(wall_times) if wall_times else 0.0
 
-    tokens_total = token_totals["sentence_total_tokens"] + token_totals["reader_total_tokens"]
-    t_total_ms = wall_time_total_sec * 1000
+    tokens_total = (
+        token_totals["sentence_total_tokens"] + token_totals["reader_total_tokens"]
+    )
+    queries_total = len(per_query)
+    tokens_per_query_mean = tokens_total / queries_total if queries_total else 0.0
+    total_time_ms = wall_time_sec_total * 1000
+    total_calls = token_totals["n_sentence_calls"] + token_totals["n_reader_calls"]
     throughput = compute_throughput_stats(
         tokens_total=tokens_total,
-        t_total_ms=t_total_ms,
-        num_queries=len(per_query),
-        n_reader_calls=token_totals["n_sentence_calls"] + token_totals["n_reader_calls"],
-        t_reader_ms=t_total_ms,
+        t_total_ms=total_time_ms,
+        num_queries=queries_total,
+        n_reader_calls=total_calls,
+        t_reader_ms=total_time_ms,
     )
 
     summary = {
-        "dataset": dataset,
-        "split": split,
-        "variant": variant,
-        "retriever": retriever,
-        "chunking_mode": chunking_mode,
-        "reader_model": reader_model,
-        "sentence_model": sentence_model,
-        "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-        "EM": agg_scores["EM"],
-        "F1": agg_scores["F1"],
-        "wall_time_total_sec": round(wall_time_total_sec, 4),
-        "wall_time_mean_sec": round(wall_time_mean_sec, 4),
-        "wall_time_median_sec": round(wall_time_median_sec, 4),
-        "tokens_total": tokens_total,
-        "t_total_ms": t_total_ms,
-        **token_totals,
-        **throughput,
+        "meta": {
+            "dataset": dataset,
+            "split": split,
+            "variant": variant,
+            "retriever": retriever,
+            "reader_model": reader_model,
+            "sentence_model": sentence_model,
+            "chunking_mode": chunking_mode,
+            "sentence_mode": SENTENCE_MODE,
+            "queries_total": queries_total,
+            "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        },
+        "accuracy": {
+            "mean_em": agg_scores["mean_em"],
+            "mean_f1": agg_scores["mean_f1"],
+        },
+        "latency": {
+            "wall_time_sec_total": round(wall_time_sec_total, 4),
+            "wall_time_sec_mean": round(wall_time_sec_mean, 4),
+            "wall_time_sec_median": round(wall_time_sec_median, 4),
+        },
+        "cost": {
+            "tokens_total": tokens_total,
+            "tokens_per_query_mean": round(tokens_per_query_mean, 4),
+            "reader_prompt_tokens_total": token_totals["reader_prompt_tokens"],
+            "reader_output_tokens_total": token_totals["reader_output_tokens"],
+            "reader_tokens_total": token_totals["reader_total_tokens"],
+            "reader_calls_total": token_totals["n_reader_calls"],
+            "sentence_extractor_prompt_tokens_total": token_totals[
+                "sentence_prompt_tokens"
+            ],
+            "sentence_extractor_output_tokens_total": token_totals[
+                "sentence_output_tokens"
+            ],
+            "sentence_extractor_tokens_total": token_totals["sentence_total_tokens"],
+            "sentence_extractor_calls_total": token_totals["n_sentence_calls"],
+            "reader_prompt_tokens_per_query_mean": round(
+                token_totals["reader_prompt_tokens"] / queries_total, 4
+            )
+            if queries_total
+            else 0.0,
+        },
+        "throughput": {
+            "total_time_ms": total_time_ms,
+            **throughput,
+        },
+        "artifacts": {
+            "answer_metrics_path": str(paths["answer_metrics"]),
+            "answers_path": str(paths["answers"]),
+        },
     }
+    if seed is not None:
+        summary["meta"]["seed"] = seed
+    if hits_at_k_scores:
+        summary["retrieval"] = {
+            "mean_hits_at_k_ratio": round(
+                sum(hits_at_k_scores) / len(hits_at_k_scores), 4
+            ),
+            "mean_recall_at_k_ratio": round(
+                sum(recall_at_k_scores) / len(recall_at_k_scores), 4
+            ),
+        }
 
     with open(paths["summary"], "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print(
         f"[summary] {dataset}/{split}/{retriever} "
-        f"wall_time={wall_time_total_sec:.2f}s "
-        f"tps={throughput.get('tps_overall', 0.0):.2f}"
+        f"wall_time={wall_time_sec_total:.2f}s "
+        f"tps={throughput.get('tokens_per_sec', 0.0):.2f}"
     )
 
     return summary
@@ -743,23 +831,25 @@ def main() -> None:
             for retriever, enabled in RETRIEVER_CONFIG.items():
                 if not enabled:
                     continue
-                print(
-                    f"\n[DA_EXIT] dataset={dataset} split={split} retriever={retriever} "
-                    f"chunking={CHUNKING_MODE} top_k_chunks={TOP_K_CHUNKS} top_k_sentences={TOP_K_SENTENCES}"
-                )
-                run_da_exit(
-                    dataset=dataset,
-                    split=split,
-                    retriever=retriever,
-                    reader_model=READER_MODEL,
-                    sentence_model=SENTENCE_GRADER_MODEL,
-                    server_url=SERVER_URL,
-                    top_k_chunks=TOP_K_CHUNKS,
-                    top_k_sentences=TOP_K_SENTENCES,
-                    chunking_mode=CHUNKING_MODE,
-                    seed=SEED,
-                    resume=RESUME,
-                )
+                for top_k_chunks in TOP_K_CHUNK_SWEEP:
+                    for seed in SEEDS:
+                        print(
+                            f"\n[DA_EXIT] dataset={dataset} split={split} retriever={retriever} "
+                            f"chunking={CHUNKING_MODE} sentence_mode={SENTENCE_MODE} "
+                            f"top_k_chunks={top_k_chunks} seed={seed}"
+                        )
+                        run_da_exit(
+                            dataset=dataset,
+                            split=split,
+                            retriever=retriever,
+                            reader_model=READER_MODEL,
+                            sentence_model=SENTENCE_GRADER_MODEL,
+                            server_url=SERVER_URL,
+                            top_k_chunks=top_k_chunks,
+                            chunking_mode=CHUNKING_MODE,
+                            seed=seed,
+                            resume=RESUME,
+                        )
 
 
 if __name__ == "__main__":

@@ -36,7 +36,7 @@ def main() -> None:
     SPLIT = "train"
     # Must match a key from processed_dataset_paths (e.g., passages, full_passages,
     # passages_discourse_aware, full_passages_chunks, full_passages_chunks_discourse_aware).
-    PASSAGE_SOURCE = "full_passages_chunks"
+    PASSAGE_SOURCE = "passages" # full_passages_chunks
 
     # -------------------------------
     # Phase A: Passages (Dataset-only)

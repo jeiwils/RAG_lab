@@ -37,7 +37,6 @@ from src.d1_evaluation.retrieval_metrics import (
     compute_hits_at_k,
     compute_recall_at_k,
 )
-from src.d1_evaluation.stats_metrics import append_percentiles
 from src.d1_evaluation.timing_metrics import (
     compute_throughput_stats,
     summarize_reader_wall_times,
@@ -57,28 +56,36 @@ from src.utils.__utils__ import (
 __all__ = ["run_baseline_rag", "run_dense_rag"]
 
 # ---------------------------------------------------------------------------
-# Public API
+# #### Configs
 # ---------------------------------------------------------------------------
 
-
-DEFAULT_TOP_K = 20
-DEFAULT_SEED_TOP_K = DEFAULT_TOP_K
-DEFAULT_RETRIEVER = "dense"
-ALLOWED_RETRIEVERS = {"dense", "sparse", "hybrid"}
+# Defaults used by run_baseline_rag
+TOP_K = 20
 RETRIEVER_CONFIG = {
     "dense": True,
     "sparse": True,
     "hybrid": True,
 }
-HYBRID_ALPHA = DEFAULT_HYBRID_ALPHA
+
+# Defaults used by main()
+DATASETS = ["hotpotqa", "2wikimultihopqa", "musique"]
+SPLITS = ["train"]
+READER_MODELS = ["Qwen/Qwen2.5-7B-Instruct"]
+SERVER_URL = "http://localhost:8005"
+SEEDS = [1] #[1, 2, 3]
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 
 def run_baseline_rag(
     dataset: str,
     split: str,
     reader_model: str,
-    retriever: str = DEFAULT_RETRIEVER,
+    retriever: str,
     server_url: str | None = None,
-    top_k: int = DEFAULT_TOP_K,
+    top_k: int = TOP_K,
     alpha: float = DEFAULT_HYBRID_ALPHA,
     seed: int | None = None,
     resume: bool = False,
@@ -123,14 +130,13 @@ def run_baseline_rag(
     Returns
     -------
     Dict[str, Any]
-        Top-level metadata with ``dense_eval`` containing EM, F1,
-        ``mean_hits_at_k`` and ``mean_recall_at_k`` scores across the
-        query set.
+        Nested summary schema with ``meta``, ``accuracy``, ``latency``,
+        ``cost``, and optional ``retrieval``/``throughput`` sections.
     """
 
-    if retriever not in ALLOWED_RETRIEVERS:
+    if retriever not in RETRIEVER_CONFIG:
         raise ValueError(
-            f"Unknown retriever '{retriever}'. Choose from {sorted(ALLOWED_RETRIEVERS)}."
+            f"Unknown retriever '{retriever}'. Choose from {sorted(RETRIEVER_CONFIG)}."
         )
 
     if seed is not None:
@@ -299,12 +305,12 @@ def run_baseline_rag(
         reader_wall_times,
         n_reader_calls=token_totals["n_reader_calls"],
     )
-    reader_wall_time_total_sec = timing_stats["reader_wall_time_total_sec"]
-    reader_wall_time_mean_sec = timing_stats["reader_wall_time_mean_sec"]
-    reader_wall_time_median_sec = timing_stats["reader_wall_time_median_sec"]
-    wall_time_total_sec = sum(wall_times)
-    wall_time_mean_sec = wall_time_total_sec / len(wall_times) if wall_times else 0.0
-    wall_time_median_sec = float(np.median(wall_times)) if wall_times else 0.0
+    reader_wall_time_sec_total = timing_stats["reader_wall_time_sec_total"]
+    reader_wall_time_sec_mean = timing_stats["reader_wall_time_sec_mean"]
+    reader_wall_time_sec_median = timing_stats["reader_wall_time_sec_median"]
+    wall_time_sec_total = sum(wall_times)
+    wall_time_sec_mean = wall_time_sec_total / len(wall_times) if wall_times else 0.0
+    wall_time_sec_median = float(np.median(wall_times)) if wall_times else 0.0
     now_ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     metric_records = [
         {
@@ -325,50 +331,16 @@ def run_baseline_rag(
     else:
         save_jsonl(str(paths["answer_metrics"]), metric_records)
 
-    dense_eval = {
-        "EM": agg_scores["EM"],
-        "F1": agg_scores["F1"],
-        "reader_wall_time_total_sec": round(reader_wall_time_total_sec, 4),
-        "reader_wall_time_mean_sec": round(reader_wall_time_mean_sec, 4),
-        "reader_wall_time_median_sec": round(reader_wall_time_median_sec, 4),
-        "wall_time_total_sec": round(wall_time_total_sec, 4),
-        "wall_time_mean_sec": round(wall_time_mean_sec, 4),
-        "wall_time_median_sec": round(wall_time_median_sec, 4),
-    }
-    if hits_at_k_scores:
-        dense_eval["mean_hits_at_k"] = round(
-            sum(hits_at_k_scores.values()) / len(hits_at_k_scores), 4
-        )
-    if recall_at_k_scores:
-        dense_eval["mean_recall_at_k"] = round(
-            sum(recall_at_k_scores.values()) / len(recall_at_k_scores), 4
-        )
-
-    metrics = {
-        "dataset": dataset,
-        "split": split,
-        "variant": variant,
-        "model": reader_model,
-        "retriever": retriever,
-        "timestamp": now_ts,
-        "dense_eval": dense_eval,
-    }
-
-    if seed is not None:
-        metrics["seed"] = seed
-    with open(paths["summary"], "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-
-    t_reader_ms = timing_stats["t_reader_ms"]
-    num_queries = len(per_query_reader)
+    reader_time_ms_total = timing_stats["reader_time_ms_total"]
+    queries_total = len(per_query)
     query_latency_ms = timing_stats["query_latency_ms"]
     call_latency_ms = timing_stats["call_latency_ms"]
 
     usage = {
         "per_query_reader": per_query_reader,
         **token_totals,
-        "t_reader_ms": t_reader_ms,
-        "num_queries": num_queries,
+        "t_reader_ms": reader_time_ms_total,
+        "num_queries": queries_total,
         "query_latency_ms": query_latency_ms,
         "call_latency_ms": call_latency_ms,
     }
@@ -377,63 +349,93 @@ def run_baseline_rag(
     with open(usage_path, "w", encoding="utf-8") as f:
         json.dump(usage, f, indent=2)
 
-    merge_token_usage(paths["base"], run_id=run_id, cleanup=True)
+    token_usage_path = merge_token_usage(paths["base"], run_id=run_id, cleanup=True)
 
-    dense_eval.update(
-        {
-            **token_totals,
-            "t_reader_ms": t_reader_ms,
-            "num_queries": num_queries,
-            "query_latency_ms": query_latency_ms,
-            "call_latency_ms": call_latency_ms,
-        }
-    )
-
-    tokens_total = dense_eval.get("reader_total_tokens", 0)
-    t_total_ms = dense_eval.get("t_reader_ms", 0)
+    tokens_total = token_totals.get("reader_total_tokens", 0)
+    tokens_per_query_mean = tokens_total / queries_total if queries_total else 0.0
+    total_time_ms = wall_time_sec_total * 1000
     throughput = compute_throughput_stats(
         tokens_total=tokens_total,
-        t_total_ms=t_total_ms,
-        num_queries=num_queries,
+        t_total_ms=total_time_ms,
+        num_queries=queries_total,
         n_reader_calls=token_totals["n_reader_calls"],
-        t_reader_ms=t_reader_ms,
+        t_reader_ms=total_time_ms,
     )
-    tps_overall = throughput["tps_overall"]
-    query_qps_reader = throughput["query_qps_reader"]
-    cps_reader = throughput["cps_reader"]
-    dense_eval.update(
-        {
+    tokens_per_sec = throughput["tokens_per_sec"]
+    queries_per_sec = throughput["queries_per_sec"]
+    calls_per_sec = throughput["calls_per_sec"]
+
+    retrieval: Dict[str, float] = {}
+    if hits_at_k_scores:
+        retrieval["mean_hits_at_k_ratio"] = round(
+            sum(hits_at_k_scores.values()) / len(hits_at_k_scores), 4
+        )
+    if recall_at_k_scores:
+        retrieval["mean_recall_at_k_ratio"] = round(
+            sum(recall_at_k_scores.values()) / len(recall_at_k_scores), 4
+        )
+
+    summary: Dict[str, Any] = {
+        "meta": {
+            "dataset": dataset,
+            "split": split,
+            "variant": variant,
+            "retriever": retriever,
+            "reader_model": reader_model,
+            "queries_total": queries_total,
+            "timestamp": now_ts,
+        },
+        "accuracy": {
+            "mean_em": agg_scores["mean_em"],
+            "mean_f1": agg_scores["mean_f1"],
+        },
+        "latency": {
+            "wall_time_sec_total": round(wall_time_sec_total, 4),
+            "wall_time_sec_mean": round(wall_time_sec_mean, 4),
+            "wall_time_sec_median": round(wall_time_sec_median, 4),
+            "reader_wall_time_sec_total": round(reader_wall_time_sec_total, 4),
+            "reader_wall_time_sec_mean": round(reader_wall_time_sec_mean, 4),
+            "reader_wall_time_sec_median": round(reader_wall_time_sec_median, 4),
+        },
+        "cost": {
             "tokens_total": tokens_total,
-            "t_total_ms": t_total_ms,
-            **throughput,
-        }
-    )
-    token_usage_file = paths["base"] / "token_usage.json"
-    try:
-        with open(token_usage_file, "r", encoding="utf-8") as f:
-            token_usage_data = json.load(f)
-    except FileNotFoundError:
-        token_usage_data = {}
-    token_usage_data["query_qps_reader"] = query_qps_reader
-    token_usage_data["cps_reader"] = cps_reader
-    token_usage_data["num_queries"] = num_queries
-    token_usage_data["query_latency_ms"] = query_latency_ms
-    token_usage_data["call_latency_ms"] = call_latency_ms
-    with open(token_usage_file, "w", encoding="utf-8") as f:
-        json.dump(token_usage_data, f, indent=2)
+            "tokens_per_query_mean": round(tokens_per_query_mean, 4),
+            "reader_prompt_tokens_total": token_totals.get("reader_prompt_tokens", 0),
+            "reader_output_tokens_total": token_totals.get("reader_output_tokens", 0),
+            "reader_tokens_total": token_totals.get("reader_total_tokens", 0),
+            "reader_calls_total": token_totals.get("n_reader_calls", 0),
+            "reader_prompt_tokens_per_query_mean": round(
+                token_totals.get("reader_prompt_tokens", 0) / queries_total, 4
+            )
+            if queries_total
+            else 0.0,
+        },
+        "throughput": {
+            "total_time_ms": total_time_ms,
+            "tokens_per_sec": tokens_per_sec,
+            "queries_per_sec": queries_per_sec,
+            "calls_per_sec": calls_per_sec,
+        },
+        "artifacts": {
+            "token_usage_path": str(token_usage_path),
+            "answer_metrics_path": str(paths["answer_metrics"]),
+            "answers_path": str(paths["answers"]),
+        },
+    }
+    if retrieval:
+        summary["retrieval"] = retrieval
+    if seed is not None:
+        summary["meta"]["seed"] = seed
 
     print(
-        f"[summary] overall throughput: {tps_overall:.2f} tokens/s, "
-        f"reader throughput: {query_qps_reader:.2f} queries/s, {cps_reader:.2f} calls/s, "
-        f"reader latency: {query_latency_ms:.2f} ms/query, {call_latency_ms:.2f} ms/call"
+        f"[summary] overall throughput: {tokens_per_sec:.2f} tokens/s, "
+        f"{queries_per_sec:.2f} queries/s, {calls_per_sec:.2f} calls/s, "
+        f"latency: {query_latency_ms:.2f} ms/query, {call_latency_ms:.2f} ms/call"
     )
     with open(paths["summary"], "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(summary, f, indent=2)
 
-    extra = append_percentiles(paths["answer_metrics"], paths["summary"])
-    dense_eval.update(extra)
-
-    return metrics
+    return summary
 
 
 def run_dense_rag(*args, **kwargs) -> Dict[str, Any]:
@@ -442,26 +444,6 @@ def run_dense_rag(*args, **kwargs) -> Dict[str, Any]:
 
 
 def main() -> None:
-    DATASETS = ["hotpotqa", "2wikimultihopqa", "musique"]
-    SPLITS = ["dev"]
-
-    READER_MODELS = ["deepseek-r1-distill-qwen-7b"]
-
-    #     "qwen2.5-7b-instruct",
-    #     "qwen2.5-14b-instruct",
-
-    #     "deepseek-r1-distill-qwen-7b",
-    #     "deepseek-r1-distill-qwen-14b",
-
-    #     "state-of-the-moe-rp-2x7b",
-
-    #     "qwen2.5-2x7b-moe-power-coder-v4"
-    # ]
-
-    SEEDS = [1, 2, 3]
-
-    TOP_K = DEFAULT_SEED_TOP_K
-
     for seed in SEEDS:
         for dataset in DATASETS:
             for split in SPLITS:
@@ -477,9 +459,10 @@ def main() -> None:
                             dataset,
                             split,
                             reader_model=reader,
+                            server_url=SERVER_URL,
                             retriever=retriever,
                             top_k=TOP_K,
-                            alpha=HYBRID_ALPHA,
+                            alpha=DEFAULT_HYBRID_ALPHA,
                             seed=seed,
                             resume=True,
                         )

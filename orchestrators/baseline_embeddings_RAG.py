@@ -35,6 +35,7 @@ from src.d1_evaluation.answer_metrics import (
 )
 from src.d1_evaluation.retrieval_metrics import (
     compute_hits_at_k,
+    compute_precision_at_k,
     compute_recall_at_k,
 )
 from src.d1_evaluation.timing_metrics import (
@@ -48,6 +49,7 @@ from src.utils.__utils__ import (
     compute_resume_sets,
     get_result_paths,
     get_server_configs,
+    limit_questions,
     load_jsonl,
     processed_dataset_paths,
     save_jsonl,
@@ -60,7 +62,7 @@ __all__ = ["run_baseline_rag", "run_dense_rag"]
 # ---------------------------------------------------------------------------
 
 # Defaults used by run_baseline_rag
-TOP_K = 20
+TOP_K_SWEEP = [5] # [1, 5, 10, 20]
 RETRIEVER_CONFIG = {
     "dense": True,
     "sparse": True,
@@ -69,10 +71,13 @@ RETRIEVER_CONFIG = {
 
 # Defaults used by main()
 DATASETS = ["hotpotqa", "2wikimultihopqa", "musique"]
-SPLITS = ["train"]
+# Use val for tuning, dev for final metrics.
+SPLITS = ["val", "dev"]
 READER_MODELS = ["Qwen/Qwen2.5-7B-Instruct"]
 SERVER_URL = "http://localhost:8005"
 SEEDS = [1] #[1, 2, 3]
+MAX_QUESTIONS: int | None = 100  # set to None to use the full split
+SHUFFLE_QUESTIONS = False
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -85,7 +90,7 @@ def run_baseline_rag(
     reader_model: str,
     retriever: str,
     server_url: str | None = None,
-    top_k: int = TOP_K,
+    top_k: int = 20,
     alpha: float = DEFAULT_HYBRID_ALPHA,
     seed: int | None = None,
     resume: bool = False,
@@ -156,7 +161,12 @@ def run_baseline_rag(
         encoder = get_embedding_model()
 
     query_path = processed_dataset_paths(dataset, split)["questions"]
-    queries = list(load_jsonl(query_path))
+    queries = limit_questions(
+        list(load_jsonl(query_path)),
+        max_questions=MAX_QUESTIONS,
+        seed=seed,
+        shuffle=SHUFFLE_QUESTIONS,
+    )
 
     variant = retriever if seed is None else f"{retriever}_seed{seed}"
     paths = get_result_paths(reader_model, dataset, split, variant)
@@ -177,6 +187,7 @@ def run_baseline_rag(
     gold: Dict[str, List[str]] = {}
     hits_at_k_scores: Dict[str, float] = {}
     recall_at_k_scores: Dict[str, float] = {}
+    precision_at_k_scores: Dict[str, float] = {}
 
     token_totals = {
         "reader_prompt_tokens": 0,
@@ -212,6 +223,7 @@ def run_baseline_rag(
             passage_ids = [passages[i]["passage_id"] for i in idxs]
             hits_val = compute_hits_at_k(passage_ids, gold_passages, top_k)
             recall_val = compute_recall_at_k(passage_ids, gold_passages, top_k)
+            precision_val = compute_precision_at_k(passage_ids, gold_passages, top_k)
             llm_out, reader_elapsed_sec = wall_time(
                 ask_llm_with_passages,
                 query_text=q_text,
@@ -252,6 +264,7 @@ def run_baseline_rag(
                 "used_passages": passage_ids,
                 "hits_at_k": hits_val,
                 "recall_at_k": recall_val,
+                "precision_at_k": precision_val,
                 "prompt_len": llm_out.get("prompt_len", 0),
                 "output_tokens": llm_out.get("output_tokens", 0),
                 "total_tokens": llm_out.get("total_tokens", 0),
@@ -271,6 +284,7 @@ def run_baseline_rag(
         predictions[q_id] = llm_out["normalised_answer"]
         hits_at_k_scores[q_id] = hits_val
         recall_at_k_scores[q_id] = recall_val
+        precision_at_k_scores[q_id] = precision_val
 
         token_totals["n_reader_calls"] += 1
         token_totals["reader_prompt_tokens"] += llm_out.get("prompt_len", 0)
@@ -374,6 +388,10 @@ def run_baseline_rag(
         retrieval["mean_recall_at_k_ratio"] = round(
             sum(recall_at_k_scores.values()) / len(recall_at_k_scores), 4
         )
+    if precision_at_k_scores:
+        retrieval["mean_precision_at_k_ratio"] = round(
+            sum(precision_at_k_scores.values()) / len(precision_at_k_scores), 4
+        )
 
     summary: Dict[str, Any] = {
         "meta": {
@@ -382,6 +400,7 @@ def run_baseline_rag(
             "variant": variant,
             "retriever": retriever,
             "reader_model": reader_model,
+            "n_chunks": len(passages),
             "queries_total": queries_total,
             "timestamp": now_ts,
         },
@@ -447,26 +466,31 @@ def main() -> None:
     for seed in SEEDS:
         for dataset in DATASETS:
             for split in SPLITS:
+                questions_path = processed_dataset_paths(dataset, split)["questions"]
+                if not os.path.exists(questions_path):
+                    print(f"[skip] missing {dataset}/{split} questions: {questions_path}")
+                    continue
                 for reader in READER_MODELS:
                     for retriever, enabled in RETRIEVER_CONFIG.items():
                         if not enabled:
                             continue
-                        print(
-                            f"[Baseline RAG] dataset={dataset} split={split} retriever={retriever} "
-                            f"reader={reader} top_k={TOP_K} seed={seed}"
-                        )
-                        metrics = run_baseline_rag(
-                            dataset,
-                            split,
-                            reader_model=reader,
-                            server_url=SERVER_URL,
-                            retriever=retriever,
-                            top_k=TOP_K,
-                            alpha=DEFAULT_HYBRID_ALPHA,
-                            seed=seed,
-                            resume=True,
-                        )
-                        print(metrics)
+                        for top_k in TOP_K_SWEEP:
+                            print(
+                                f"[Baseline RAG] dataset={dataset} split={split} retriever={retriever} "
+                                f"reader={reader} top_k={top_k} seed={seed}"
+                            )
+                            metrics = run_baseline_rag(
+                                dataset,
+                                split,
+                                reader_model=reader,
+                                server_url=SERVER_URL,
+                                retriever=retriever,
+                                top_k=top_k,
+                                alpha=DEFAULT_HYBRID_ALPHA,
+                                seed=seed,
+                                resume=True,
+                            )
+                            print(metrics)
     print("\nBaseline RAG complete.")
 
 

@@ -54,6 +54,7 @@ Query
 from __future__ import annotations
 
 import json
+import os
 import random
 from functools import lru_cache
 from datetime import datetime
@@ -62,6 +63,11 @@ from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+
+# Ensure deterministic CuBLAS when deterministic algorithms are enabled.
+# Must be set before CUDA is initialized.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
 from peft import PeftModel
 from tqdm import tqdm
@@ -84,6 +90,7 @@ from src.c1_reasoning.sentence_reasoning import (
     _build_sentence_candidates,
     _select_top_sentences,
     compute_passage_hits_recall_at_k,
+    compute_passage_precision_at_k,
 )
 from src.c2_generation.answer_gen import ask_llm_with_passages
 from src.d1_evaluation.answer_metrics import aggregate_answer_scores, evaluate_answers
@@ -93,6 +100,7 @@ from src.utils.__utils__ import (
     compute_resume_sets,
     get_result_paths,
     get_server_configs,
+    limit_questions,
     load_jsonl,
     processed_dataset_paths,
     save_jsonl,
@@ -105,11 +113,12 @@ __all__ = ["run_da_exit", "main"]
 # ---------------------------------------------------------------------------
 
 # Sentence usefulness cutoff (set from best_metrics.json of chosen LoRA model)
-TAU_LOW = 0.58
+TAU_LOW = 0.58 # CHANGE THIS TO TAU_THRESHOLD 
 # Total token budget for selected sentences (adjust for reader context size).
 
 DATASETS = ["musique", "hotpotqa", "2wikimultihopqa", "natural_questions"]
-SPLITS = ["train"]
+# Use val for tuning, dev for final metrics.
+SPLITS = ["val", "dev"]
 RETRIEVER_CONFIG = {
     "hybrid": True,
     "dense": False,
@@ -120,7 +129,7 @@ RETRIEVER_CONFIG = {
 CHUNKING_MODE = "standard_chunks"  # "standard_chunks" | "discourse_aware_chunks"
 # Sentence mode controls post-ranking expansion for the reader context.
 # "standard_sentences" = no expansion; "discourse_aware_sentences" = expand after ranking.
-SENTENCE_MODE = "discourse_aware_sentences"  # "standard_sentences" | "discourse_aware_sentences"
+SENTENCE_MODES = ["standard_sentences", "discourse_aware_sentences"]
 
 
 SENTENCE_TOKEN_BUDGET = 512
@@ -137,6 +146,8 @@ SENTENCE_LORA_MAX_LEN = DEFAULT_MAX_LEN
 SENTENCE_LORA_LOCAL_FILES_ONLY = True
 
 SEEDS = [1] #[1, 2, 3]
+MAX_QUESTIONS: int | None = 100  # set to None to use the full split
+SHUFFLE_QUESTIONS = False
 RESUME = True
 
 # Debug logging of ranked candidates (can be large).
@@ -290,6 +301,7 @@ def run_da_exit(
     server_url: str | None,
     top_k_chunks: int,
     chunking_mode: str,
+    sentence_mode: str,
     seed: int | None,
     resume: bool,
 ) -> Dict[str, Any]:
@@ -330,9 +342,15 @@ def run_da_exit(
     encoder = get_embedding_model() if retriever in {"dense", "hybrid"} else None
 
     questions_path = processed_paths["questions"]
-    questions = list(load_jsonl(str(questions_path)))
+    questions = limit_questions(
+        list(load_jsonl(str(questions_path))),
+        max_questions=MAX_QUESTIONS,
+        seed=seed,
+        shuffle=SHUFFLE_QUESTIONS,
+    )
 
-    variant = f"da_exit_{chunking_mode}_{SENTENCE_MODE}_{retriever}_k{top_k_chunks}"
+    method_prefix = "exit" if sentence_mode == "standard_sentences" else "da_exit"
+    variant = f"{method_prefix}_{retriever}_k{top_k_chunks}"
     if seed is not None:
         variant = f"{variant}_seed{seed}"
     paths = get_result_paths(reader_model, dataset, split, variant)
@@ -370,6 +388,7 @@ def run_da_exit(
     }
     hits_at_k_scores: List[float] = []
     recall_at_k_scores: List[float] = []
+    precision_at_k_scores: List[float] = []
 
     for q in tqdm(questions, desc=f"{dataset}/{split}/{retriever}"):
         q_id = q["question_id"]
@@ -397,7 +416,7 @@ def run_da_exit(
             sentences: List[Dict[str, Any]] = []
             expanded_by_id: Dict[str, Dict[str, Any]] = {}
             chunk_ids: List[str] = []
-            expand_after = SENTENCE_MODE == "discourse_aware_sentences"
+            expand_after = sentence_mode == "discourse_aware_sentences"
             for chunk in chunks:
                 chunk_id = chunk.get("chunk_id", chunk.get("passage_id", "chunk"))
                 chunk_ids.append(chunk_id)
@@ -453,7 +472,7 @@ def run_da_exit(
                     "variant": variant,
                     "retriever": retriever,
                     "chunking_mode": chunking_mode,
-                    "sentence_mode": SENTENCE_MODE,
+                    "sentence_mode": sentence_mode,
                     "expand_after_rerank": expand_after,
                     "reader_model": reader_model,
                     "question_id": q_id,
@@ -645,6 +664,12 @@ def run_da_exit(
             )
             hits_at_k_scores.append(passage_metrics["hits_at_k_ratio"])
             recall_at_k_scores.append(passage_metrics["recall_at_k_ratio"])
+            precision_metrics = compute_passage_precision_at_k(
+                selected_sentences,
+                gold_passages,
+                k=None,
+            )
+            precision_at_k_scores.append(precision_metrics["precision_at_k_ratio"])
 
         append_jsonl(
             str(paths["answers"]),
@@ -750,7 +775,8 @@ def run_da_exit(
             "reader_model": reader_model,
             "sentence_model": sentence_model,
             "chunking_mode": chunking_mode,
-            "sentence_mode": SENTENCE_MODE,
+            "sentence_mode": sentence_mode,
+            "n_chunks": len(metadata),
             "queries_total": queries_total,
             "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         },
@@ -803,6 +829,11 @@ def run_da_exit(
             "mean_recall_at_k_ratio": round(
                 sum(recall_at_k_scores) / len(recall_at_k_scores), 4
             ),
+            "mean_precision_at_k_ratio": round(
+                sum(precision_at_k_scores) / len(precision_at_k_scores), 4
+            )
+            if precision_at_k_scores
+            else 0.0,
         }
 
     with open(paths["summary"], "w", encoding="utf-8") as f:
@@ -828,28 +859,34 @@ def main() -> None:
 
     for dataset in DATASETS:
         for split in SPLITS:
+            questions_path = processed_dataset_paths(dataset, split)["questions"]
+            if not Path(questions_path).exists():
+                print(f"[skip] missing {dataset}/{split} questions: {questions_path}")
+                continue
             for retriever, enabled in RETRIEVER_CONFIG.items():
                 if not enabled:
                     continue
-                for top_k_chunks in TOP_K_CHUNK_SWEEP:
-                    for seed in SEEDS:
-                        print(
-                            f"\n[DA_EXIT] dataset={dataset} split={split} retriever={retriever} "
-                            f"chunking={CHUNKING_MODE} sentence_mode={SENTENCE_MODE} "
-                            f"top_k_chunks={top_k_chunks} seed={seed}"
-                        )
-                        run_da_exit(
-                            dataset=dataset,
-                            split=split,
-                            retriever=retriever,
-                            reader_model=READER_MODEL,
-                            sentence_model=SENTENCE_GRADER_MODEL,
-                            server_url=SERVER_URL,
-                            top_k_chunks=top_k_chunks,
-                            chunking_mode=CHUNKING_MODE,
-                            seed=seed,
-                            resume=RESUME,
-                        )
+                for sentence_mode in SENTENCE_MODES:
+                    for top_k_chunks in TOP_K_CHUNK_SWEEP:
+                        for seed in SEEDS:
+                            print(
+                                f"\n[DA_EXIT] dataset={dataset} split={split} retriever={retriever} "
+                                f"chunking={CHUNKING_MODE} sentence_mode={sentence_mode} "
+                                f"top_k_chunks={top_k_chunks} seed={seed}"
+                            )
+                            run_da_exit(
+                                dataset=dataset,
+                                split=split,
+                                retriever=retriever,
+                                reader_model=READER_MODEL,
+                                sentence_model=SENTENCE_GRADER_MODEL,
+                                server_url=SERVER_URL,
+                                top_k_chunks=top_k_chunks,
+                                chunking_mode=CHUNKING_MODE,
+                                sentence_mode=sentence_mode,
+                                seed=seed,
+                                resume=RESUME,
+                            )
 
 
 if __name__ == "__main__":

@@ -13,7 +13,11 @@ from src.utils.algorithms.discourse_aware import (
 )
 from src.utils.x_config import LLM_DEFAULTS, MAX_TOKENS, TEMPERATURE
 from src.utils.z_llm_utils import is_r1_like, query_llm, strip_think
-from src.d1_evaluation.retrieval_metrics import compute_hits_at_k, compute_recall_at_k
+from src.d1_evaluation.retrieval_metrics import (
+    compute_hits_at_k,
+    compute_precision_at_k,
+    compute_recall_at_k,
+)
 
 __all__ = [
     "DEFAULT_SENTENCE_EVAL_PROMPT",
@@ -21,6 +25,7 @@ __all__ = [
     "evaluate_sentence_usefulness",
     "extract_passage_ids_from_sentences",
     "compute_passage_hits_recall_at_k",
+    "compute_passage_precision_at_k",
     "split_chunk_sentences",
     "_score_sentences",
     "_build_sentence_candidates",
@@ -33,7 +38,7 @@ _SENT_SUFFIX_RE = re.compile(r"__sent\d+$")
 _CHUNK_SUFFIX_RE = re.compile(r"__chunk\d+$")
 
 
-DEFAULT_SENTENCE_EVAL_PROMPT = (
+DEFAULT_SENTENCE_EVAL_PROMPT = ( # isn't this unused? isn't the prompt with context sent to the lora/reranker?
     "You are grading how useful a single sentence is for answering a question.\n"
     "Use the integer scale {MIN_SCORE} to {MAX_SCORE}.\n"
     "{MIN_SCORE} = unrelated or incorrect.\n"
@@ -112,6 +117,26 @@ def compute_passage_hits_recall_at_k(
     return {
         "hits_at_k_ratio": float(hits),
         "recall_at_k_ratio": float(recall),
+        "passage_count": float(len(passage_ids)),
+    }
+
+
+def compute_passage_precision_at_k(
+    selected_sentences: Sequence[Dict[str, Any]] | Sequence[str],
+    gold_passages: Sequence[str],
+    *,
+    k: int | None = None,
+) -> Dict[str, float]:
+    """Compute precision@k over passage ids implied by sentences.
+
+    When ``k`` is ``None``, the full list of passage ids is used.
+    """
+    passage_ids = extract_passage_ids_from_sentences(selected_sentences)
+    if k is None:
+        k = len(passage_ids)
+    precision = compute_precision_at_k(passage_ids, list(gold_passages), k)
+    return {
+        "precision_at_k_ratio": float(precision),
         "passage_count": float(len(passage_ids)),
     }
 

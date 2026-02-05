@@ -54,7 +54,10 @@ def load_summary_metrics(
 
         variant = row.get("variant", "")
         if variant:
-            row.update(parse_variant_name(variant))
+            parsed = parse_variant_name(variant)
+            for key, value in parsed.items():
+                if key not in row:
+                    row[key] = value
         if "approach" not in row:
             row["approach"] = assign_approach(row)
 

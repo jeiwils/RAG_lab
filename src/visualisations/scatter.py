@@ -43,7 +43,7 @@ def scatter_latency_accuracy_approaches(
 
     If approach_map is provided, rows are assigned to the first matching label
     (exclusive=True). This is useful for custom groupings like:
-      {"DA_EXIT": lambda r: r["variant"].startswith("da_exit_"), ...}
+      {"System_A": lambda r: r["variant"].startswith("sys_a_"), ...}
     """
     rows = list(rows)
     x = x or CONFIG["x"]

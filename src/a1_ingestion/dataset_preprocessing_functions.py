@@ -44,8 +44,11 @@ is otherwise dataset agnostic.
 
 from __future__ import annotations
 
+import csv
 import json
-from typing import Any, Callable, Dict, Iterable, List, Tuple
+import random
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple
 
 from src.a1_ingestion.chunking import (
     split_long_passage,
@@ -63,12 +66,14 @@ from src.utils.__utils__ import (
     clean_text,
     compute_resume_sets,
     existing_ids,
+    load_jsonl,
     pid_plus_title,
     pid_plus_title_full,
     processed_dataset_paths,
 )
 
 __all__ = [
+    "DEFAULT_OUTPUTS",
     "FieldMap",
     "DATASET_CONFIGS",
     "get_raw_dataset_path",
@@ -77,7 +82,32 @@ __all__ = [
     "sentence_ids_from_full",
     "sentence_passages_from_full",
     "split_text_into_sentences",
+    "ACORD_DEFAULT_POS_THRESHOLD",
+    "ACORD_DEFAULT_NEG_THRESHOLD",
+    "ACORD_DEFAULT_HARD_THRESHOLD",
+    "load_acord_queries",
+    "load_acord_corpus",
+    "load_acord_qrels_tsv",
+    "iter_acord_training_packages",
+    "write_acord_training_jsonl",
+    "process_acord_split",
 ]
+
+DEFAULT_OUTPUTS = {
+    "questions",
+    "passages",
+    "full_passages",
+    "full_passages_chunks",
+    "passages_discourse_aware",
+    "passages_discourse_aware_debug",
+    "passages_discourse_aware_aliases",
+    "full_passages_chunks_discourse_aware",
+    "full_passages_chunks_discourse_aware_debug",
+}
+
+ACORD_DEFAULT_POS_THRESHOLD = 3
+ACORD_DEFAULT_NEG_THRESHOLD = 1
+ACORD_DEFAULT_HARD_THRESHOLD = 2
 
 def _strip_full_suffix(passage_id: str) -> str:
     if passage_id.endswith("_full"):
@@ -112,6 +142,432 @@ def sentence_ids_from_full(passage_id: str, text: str) -> List[str]:
         f"{passage_id}__sent{idx}"
         for idx, _sent in enumerate(split_text_into_sentences(text))
     ]
+
+
+# ---------------------------------------------------------------------------
+# ACORD (queries/corpus/qrels) helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_acord_split(split: str) -> str:
+    """Map project split names to ACORD file split names."""
+    if split == "dev":
+        return "valid"
+    return split
+
+
+def load_acord_queries(path: str | Path) -> Dict[str, Dict[str, Any]]:
+    """Load ACORD queries.jsonl into a dict keyed by query id."""
+    queries: Dict[str, Dict[str, Any]] = {}
+    for row in load_jsonl(str(path)):
+        qid = str(row.get("_id", "")).strip()
+        if not qid:
+            continue
+        text = str(row.get("text", qid)).strip()
+        meta = row.get("metadata") or {}
+        queries[qid] = {
+            "id": qid,
+            "text": text or qid,
+            "category": str(meta.get("category", "")).strip(),
+            "split": str(meta.get("split", "")).strip(),
+            "type": str(meta.get("type", "")).strip(),
+            "parent_query_id": str(meta.get("parent_query_id", "")).strip(),
+            "metadata": meta,
+        }
+    return queries
+
+
+def load_acord_corpus(path: str | Path) -> Dict[str, str]:
+    """Load ACORD corpus.jsonl into a dict keyed by corpus id."""
+    corpus: Dict[str, str] = {}
+    for row in load_jsonl(str(path)):
+        doc_id = str(row.get("_id", "")).strip()
+        if not doc_id:
+            continue
+        text = clean_text(str(row.get("text", "")))
+        if not text:
+            continue
+        corpus[doc_id] = text
+    return corpus
+
+
+def load_acord_qrels_tsv(path: str | Path) -> Dict[str, List[Dict[str, int]]]:
+    """Load ACORD qrels TSV into a dict keyed by query id."""
+    qrels: Dict[str, List[Dict[str, int]]] = {}
+    with open(path, "rt", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            qid = str(row.get("query-id", "")).strip()
+            doc_id = str(row.get("corpus-id", "")).strip()
+            if not qid or not doc_id:
+                continue
+            raw_score = row.get("score")
+            try:
+                score = int(float(raw_score))
+            except (TypeError, ValueError):
+                continue
+            qrels.setdefault(qid, []).append({"doc_id": doc_id, "score": score})
+    return qrels
+
+
+def _dedupe_qrels(rows: Iterable[Dict[str, int]]) -> List[Dict[str, int]]:
+    """Keep the best score per doc_id for a query."""
+    best: Dict[str, int] = {}
+    for row in rows:
+        doc_id = str(row.get("doc_id", "")).strip()
+        if not doc_id:
+            continue
+        score = int(row.get("score", 0))
+        if doc_id not in best or score > best[doc_id]:
+            best[doc_id] = score
+    return [{"doc_id": doc_id, "score": score} for doc_id, score in best.items()]
+
+
+def _prepare_acord_doc_entries(
+    rows: Iterable[Dict[str, int]],
+    *,
+    include_text: bool,
+    corpus: Dict[str, str] | None,
+    max_items: int | None,
+    rng: random.Random | None,
+    sort_desc: bool = True,
+) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for row in rows:
+        doc_id = str(row.get("doc_id", "")).strip()
+        if not doc_id:
+            continue
+        score = int(row.get("score", 0))
+        entry: Dict[str, Any] = {"doc_id": doc_id, "score": score}
+        if include_text and corpus is not None:
+            entry["text"] = corpus.get(doc_id, "")
+        entries.append(entry)
+
+    if sort_desc:
+        entries.sort(key=lambda x: (-int(x.get("score", 0)), str(x.get("doc_id", ""))))
+
+    if max_items is None or max_items <= 0 or len(entries) <= max_items:
+        return entries
+
+    if rng is None:
+        return entries[:max_items]
+    return rng.sample(entries, max_items)
+
+
+def iter_acord_training_packages(
+    *,
+    split: str,
+    raw_dir: str | Path = "data/raw_datasets/ACORD",
+    pos_threshold: int = ACORD_DEFAULT_POS_THRESHOLD,
+    hard_threshold: int | None = ACORD_DEFAULT_HARD_THRESHOLD,
+    neg_threshold: int = ACORD_DEFAULT_NEG_THRESHOLD,
+    include_text: bool = False,
+    max_pos: int | None = None,
+    max_neg: int | None = None,
+    max_hard_neg: int | None = None,
+    seed: int | None = None,
+    drop_no_positives: bool = True,
+) -> Iterator[Dict[str, Any]]:
+    """Yield ACORD training packages with positive/negative document sets."""
+    raw_dir = Path(raw_dir)
+    split_alias = _normalize_acord_split(split)
+    queries_path = raw_dir / "queries.jsonl"
+    corpus_path = raw_dir / "corpus.jsonl"
+    qrels_path = raw_dir / f"{split_alias}.tsv"
+
+    queries = load_acord_queries(queries_path)
+    qrels = load_acord_qrels_tsv(qrels_path)
+    corpus = load_acord_corpus(corpus_path) if include_text else None
+
+    rng = random.Random(seed) if seed is not None else None
+
+    for qid, rels in qrels.items():
+        q = queries.get(qid)
+        if not q:
+            continue
+        if q.get("split") and str(q.get("split")) != split_alias:
+            continue
+
+        deduped = _dedupe_qrels(rels)
+        pos = [r for r in deduped if int(r.get("score", 0)) >= pos_threshold]
+        hard: List[Dict[str, int]] = []
+        if hard_threshold is not None:
+            hard = [
+                r
+                for r in deduped
+                if hard_threshold <= int(r.get("score", 0)) < pos_threshold
+            ]
+        neg = [r for r in deduped if int(r.get("score", 0)) <= neg_threshold]
+
+        if drop_no_positives and not pos:
+            continue
+
+        pos_entries = _prepare_acord_doc_entries(
+            pos,
+            include_text=include_text,
+            corpus=corpus,
+            max_items=max_pos,
+            rng=rng,
+        )
+        hard_entries = _prepare_acord_doc_entries(
+            hard,
+            include_text=include_text,
+            corpus=corpus,
+            max_items=max_hard_neg,
+            rng=rng,
+        )
+        neg_entries = _prepare_acord_doc_entries(
+            neg,
+            include_text=include_text,
+            corpus=corpus,
+            max_items=max_neg,
+            rng=rng,
+        )
+
+        yield {
+            "qid": qid,
+            "query": q.get("text", qid),
+            "category": q.get("category", ""),
+            "query_type": q.get("type", ""),
+            "split": split,
+            "pos": pos_entries,
+            "neg": neg_entries,
+            "hard_neg": hard_entries,
+            "thresholds": {
+                "pos": pos_threshold,
+                "hard": hard_threshold,
+                "neg": neg_threshold,
+            },
+        }
+
+
+def write_acord_training_jsonl(
+    *,
+    split: str,
+    raw_dir: str | Path = "data/raw_datasets/ACORD",
+    out_path: str | Path | None = None,
+    pos_threshold: int = ACORD_DEFAULT_POS_THRESHOLD,
+    hard_threshold: int | None = ACORD_DEFAULT_HARD_THRESHOLD,
+    neg_threshold: int = ACORD_DEFAULT_NEG_THRESHOLD,
+    include_text: bool = False,
+    max_pos: int | None = None,
+    max_neg: int | None = None,
+    max_hard_neg: int | None = None,
+    seed: int | None = None,
+    drop_no_positives: bool = True,
+    resume: bool = False,
+) -> str:
+    """Write ACORD training packages JSONL and return the output path."""
+    if out_path is None:
+        base = processed_dataset_paths("acord", split)["base"]
+        out_path = base / "training_packages.jsonl"
+
+    out_path = Path(out_path)
+    if out_path.exists() and not resume:
+        out_path.unlink()
+
+    done_qids = (
+        existing_ids(out_path, id_field="qid") if resume and out_path.exists() else set()
+    )
+
+    for record in iter_acord_training_packages(
+        split=split,
+        raw_dir=raw_dir,
+        pos_threshold=pos_threshold,
+        hard_threshold=hard_threshold,
+        neg_threshold=neg_threshold,
+        include_text=include_text,
+        max_pos=max_pos,
+        max_neg=max_neg,
+        max_hard_neg=max_hard_neg,
+        seed=seed,
+        drop_no_positives=drop_no_positives,
+    ):
+        qid = str(record.get("qid", ""))
+        if qid in done_qids:
+            continue
+        append_jsonl(str(out_path), record)
+
+    return str(out_path)
+
+
+def process_acord_split(
+    *,
+    split: str,
+    raw_dir: str | Path = "data/raw_datasets/ACORD",
+    include_outputs: Iterable[str] | None = None,
+    pos_threshold: int = ACORD_DEFAULT_POS_THRESHOLD,
+    hard_threshold: int | None = ACORD_DEFAULT_HARD_THRESHOLD,
+    neg_threshold: int = ACORD_DEFAULT_NEG_THRESHOLD,
+    resume: bool = True,
+    include_training_packages: bool = True,
+    training_out_path: str | Path | None = None,
+    max_pos: int | None = None,
+    max_neg: int | None = None,
+    max_hard_neg: int | None = None,
+    seed: int | None = None,
+    drop_no_positives: bool = True,
+    include_training_text: bool = False,
+) -> None:
+    """Process ACORD corpus/queries/qrels into processed dataset JSONL files."""
+    if include_outputs is None:
+        include_outputs = {"questions", "passages", "full_passages", "full_passages_chunks"}
+    include_outputs = set(include_outputs)
+
+    include_questions = "questions" in include_outputs
+    include_passages = "passages" in include_outputs
+    include_full_passages = "full_passages" in include_outputs
+    include_full_passages_chunks = "full_passages_chunks" in include_outputs
+
+    raw_dir = Path(raw_dir)
+    split_alias = _normalize_acord_split(split)
+    queries_path = raw_dir / "queries.jsonl"
+    corpus_path = raw_dir / "corpus.jsonl"
+    qrels_path = raw_dir / f"{split_alias}.tsv"
+
+    queries = load_acord_queries(queries_path)
+    qrels = load_acord_qrels_tsv(qrels_path)
+    corpus = load_acord_corpus(corpus_path)
+
+    paths = processed_dataset_paths("acord", split)
+    questions_path = str(paths["questions"])
+    passages_path = str(paths["passages"])
+    full_passages_path = str(paths["full_passages"])
+    full_passages_chunks_path = str(paths["full_passages_chunks"])
+
+    done_qids = (
+        existing_ids(questions_path, id_field="question_id")
+        if resume and include_questions
+        else set()
+    )
+    done_pids = (
+        existing_ids(passages_path, id_field="passage_id")
+        if resume and include_passages
+        else set()
+    )
+    done_full_pids = (
+        existing_ids(full_passages_path, id_field="passage_id")
+        if resume and include_full_passages
+        else set()
+    )
+    done_full_chunk_pids = (
+        existing_ids(full_passages_chunks_path, id_field="passage_id")
+        if resume and include_full_passages_chunks
+        else set()
+    )
+
+    if include_questions:
+        for qid, q in queries.items():
+            if q.get("split") and str(q.get("split")) != split_alias:
+                continue
+            if qid in done_qids:
+                continue
+            rels = _prepare_acord_doc_entries(
+                _dedupe_qrels(qrels.get(qid, [])),
+                include_text=False,
+                corpus=None,
+                max_items=None,
+                rng=None,
+            )
+            pos_ids = [
+                r["doc_id"]
+                for r in rels
+                if int(r.get("score", 0)) >= pos_threshold
+            ]
+            if drop_no_positives and not pos_ids:
+                continue
+            append_jsonl(
+                questions_path,
+                {
+                    "question_id": qid,
+                    "dataset": "acord",
+                    "split": split,
+                    "question": q.get("text", qid),
+                    "gold_answer": "",
+                    "gold_passages": pos_ids,
+                    "category": q.get("category", ""),
+                    "query_type": q.get("type", ""),
+                    "qrels": rels,
+                    "thresholds": {
+                        "pos": pos_threshold,
+                        "hard": hard_threshold,
+                        "neg": neg_threshold,
+                    },
+                },
+            )
+
+    if include_passages or include_full_passages or include_full_passages_chunks:
+        for doc_id, text in corpus.items():
+            if include_passages and doc_id not in done_pids:
+                append_jsonl(
+                    passages_path,
+                    {
+                        "passage_id": doc_id,
+                        "title": "",
+                        "text": text,
+                    },
+                )
+            if include_full_passages and doc_id not in done_full_pids:
+                append_jsonl(
+                    full_passages_path,
+                    {
+                        "passage_id": doc_id,
+                        "title": "",
+                        "text": text,
+                    },
+                )
+            if include_full_passages_chunks:
+                chunks = split_long_passage(text)
+                if not chunks:
+                    continue
+                if len(chunks) == 1:
+                    chunk_id = doc_id
+                    if chunk_id in done_full_chunk_pids:
+                        continue
+                    append_jsonl(
+                        full_passages_chunks_path,
+                        {
+                            "passage_id": chunk_id,
+                            "source_id": doc_id,
+                            "chunk_index": 0,
+                            "chunk_count": 1,
+                            "title": "",
+                            "text": chunks[0],
+                        },
+                    )
+                else:
+                    for idx, chunk_text in enumerate(chunks):
+                        chunk_id = f"{doc_id}__chunk{idx}"
+                        if chunk_id in done_full_chunk_pids:
+                            continue
+                        append_jsonl(
+                            full_passages_chunks_path,
+                            {
+                                "passage_id": chunk_id,
+                                "source_id": doc_id,
+                                "chunk_index": idx,
+                                "chunk_count": len(chunks),
+                                "title": "",
+                                "text": chunk_text,
+                            },
+                        )
+
+    if include_training_packages:
+        write_acord_training_jsonl(
+            split=split,
+            raw_dir=raw_dir,
+            out_path=training_out_path,
+            pos_threshold=pos_threshold,
+            hard_threshold=hard_threshold,
+            neg_threshold=neg_threshold,
+            include_text=include_training_text,
+            max_pos=max_pos,
+            max_neg=max_neg,
+            max_hard_neg=max_hard_neg,
+            seed=seed,
+            drop_no_positives=drop_no_positives,
+            resume=resume,
+        )
 
 ##### Dataset configs
 """Dataset-specific file paths and field maps for ingestion."""
@@ -244,6 +700,7 @@ def process_dataset(
     max_examples: int | None = None,
     overwrite: bool = False,
     resume: bool = False,
+    include_outputs: Iterable[str] | None = None,
 ) -> None:
     """Process ``file_path`` using ``field_map``.
 
@@ -269,6 +726,10 @@ def process_dataset(
         Unused but kept for backward compatibility.
     resume:
         Whether to resume from existing processed files.
+    include_outputs:
+        Optional list/set of outputs to write. When ``None``, all outputs are
+        generated. Valid values align with keys from
+        :func:`processed_dataset_paths`.
     """
 
     # ---- Load raw examples -------------------------------------------------
@@ -297,29 +758,71 @@ def process_dataset(
     gold_ids_fn = field_map.get("gold_passage_ids", lambda ex: [])
     gold_full_ids_fn = field_map.get("gold_full_passage_ids")
 
+    if include_outputs is None:
+        include_outputs = DEFAULT_OUTPUTS
+    include_outputs = set(include_outputs)
+
+    include_questions = "questions" in include_outputs
+    include_passages = "passages" in include_outputs
+    include_full_passages = "full_passages" in include_outputs
+    include_full_passages_chunks = "full_passages_chunks" in include_outputs
+    include_passages_discourse_aware = "passages_discourse_aware" in include_outputs
+    include_passages_discourse_aware_debug = (
+        "passages_discourse_aware_debug" in include_outputs
+    )
+    include_passages_discourse_aware_aliases = (
+        "passages_discourse_aware_aliases" in include_outputs
+    )
+    include_full_passages_chunks_discourse_aware = (
+        "full_passages_chunks_discourse_aware" in include_outputs
+    )
+    include_full_passages_chunks_discourse_aware_debug = (
+        "full_passages_chunks_discourse_aware_debug" in include_outputs
+    )
+
+    include_discourse_outputs = (
+        include_passages_discourse_aware
+        or include_passages_discourse_aware_debug
+        or include_passages_discourse_aware_aliases
+    )
+    include_da_chunk_outputs = (
+        include_full_passages_chunks_discourse_aware
+        or include_full_passages_chunks_discourse_aware_debug
+    )
+    any_full_outputs = (
+        include_full_passages
+        or include_full_passages_chunks
+        or include_discourse_outputs
+        or include_da_chunk_outputs
+    )
+
     # ---- Determine resume state --------------------------------------------
-    done_qids, _ = compute_resume_sets(
-        resume=resume,
-        out_path=qa_path,
-        items=examples,
-        get_id=lambda ex, i: get_id(ex),
-        phase_label=f"{dataset} {split} questions",
-        id_field="question_id",
-    )
+    done_qids: set[str] = set()
+    if include_questions:
+        done_qids, _ = compute_resume_sets(
+            resume=resume,
+            out_path=qa_path,
+            items=examples,
+            get_id=lambda ex, i: get_id(ex),
+            phase_label=f"{dataset} {split} questions",
+            id_field="question_id",
+        )
 
-    def iter_pids() -> Iterable[str]:
-        for ex in examples:
-            for pid, _title, _text in iter_passages_fn(ex):
-                yield pid
+    done_pids: set[str] = set()
+    if include_passages:
+        def iter_pids() -> Iterable[str]:
+            for ex in examples:
+                for pid, _title, _text in iter_passages_fn(ex):
+                    yield pid
 
-    done_pids, _ = compute_resume_sets(
-        resume=resume,
-        out_path=passages_path,
-        items=iter_pids(),
-        get_id=lambda pid, i: pid,
-        phase_label=f"{dataset} {split} passages",
-        id_field="passage_id",
-    )
+        done_pids, _ = compute_resume_sets(
+            resume=resume,
+            out_path=passages_path,
+            items=iter_pids(),
+            get_id=lambda pid, i: pid,
+            phase_label=f"{dataset} {split} passages",
+            id_field="passage_id",
+        )
 
     done_full_pids: set[str] = set()
     done_full_chunk_pids: set[str] = set()
@@ -335,7 +838,7 @@ def process_dataset(
     passages_discourse_aware_debug_path: str | None = None
     passages_discourse_aware_aliases_path: str | None = None
     full_passages_chunks_discourse_aware_debug_path: str | None = None
-    if iter_full_passages_fn is not None:
+    if iter_full_passages_fn is not None and any_full_outputs:
         full_passages_path = str(paths["full_passages"])
         full_passages_chunks_path = str(paths["full_passages_chunks"])
         full_passages_chunks_discourse_aware_path = str(
@@ -357,14 +860,15 @@ def process_dataset(
                 for pid, _title, _text in iter_full_passages_fn(ex):
                     yield pid
 
-        done_full_pids, _ = compute_resume_sets(
-            resume=resume,
-            out_path=full_passages_path,
-            items=iter_full_pids(),
-            get_id=lambda pid, i: pid,
-            phase_label=f"{dataset} {split} full passages",
-            id_field="passage_id",
-        )
+        if include_full_passages:
+            done_full_pids, _ = compute_resume_sets(
+                resume=resume,
+                out_path=full_passages_path,
+                items=iter_full_pids(),
+                get_id=lambda pid, i: pid,
+                phase_label=f"{dataset} {split} full passages",
+                id_field="passage_id",
+            )
 
         def iter_full_chunk_pids() -> Iterable[str]:
             for ex in examples:
@@ -379,14 +883,15 @@ def process_dataset(
                         for idx in range(len(chunks)):
                             yield f"{pid}__chunk{idx}"
 
-        done_full_chunk_pids, _ = compute_resume_sets(
-            resume=resume,
-            out_path=full_passages_chunks_path,
-            items=iter_full_chunk_pids(),
-            get_id=lambda pid, i: pid,
-            phase_label=f"{dataset} {split} full passage chunks",
-            id_field="passage_id",
-        )
+        if include_full_passages_chunks:
+            done_full_chunk_pids, _ = compute_resume_sets(
+                resume=resume,
+                out_path=full_passages_chunks_path,
+                items=iter_full_chunk_pids(),
+                get_id=lambda pid, i: pid,
+                phase_label=f"{dataset} {split} full passage chunks",
+                id_field="passage_id",
+            )
 
         def iter_full_da_chunk_pids() -> Iterable[str]:
             for ex in examples:
@@ -401,14 +906,15 @@ def process_dataset(
                         for idx in range(len(chunks)):
                             yield f"{pid}__chunk{idx}"
 
-        done_full_da_chunk_pids, _ = compute_resume_sets(
-            resume=resume,
-            out_path=full_passages_chunks_discourse_aware_path,
-            items=iter_full_da_chunk_pids(),
-            get_id=lambda pid, i: pid,
-            phase_label=f"{dataset} {split} discourse-aware full passage chunks",
-            id_field="passage_id",
-        )
+        if include_full_passages_chunks_discourse_aware:
+            done_full_da_chunk_pids, _ = compute_resume_sets(
+                resume=resume,
+                out_path=full_passages_chunks_discourse_aware_path,
+                items=iter_full_da_chunk_pids(),
+                get_id=lambda pid, i: pid,
+                phase_label=f"{dataset} {split} discourse-aware full passage chunks",
+                id_field="passage_id",
+            )
 
         def iter_discourse_pids() -> Iterable[str]:
             for ex in examples:
@@ -455,21 +961,22 @@ def process_dataset(
                         base = _strip_full_suffix(pid)
                         yield f"{base}__sent{idx}"
 
-        done_discourse_pids, _ = compute_resume_sets(
-            resume=resume,
-            out_path=passages_discourse_aware_path,
-            items=iter_discourse_pids(),
-            get_id=lambda pid, i: pid,
-            phase_label=f"{dataset} {split} discourse-aware passages",
-            id_field="passage_id",
-        )
-        if passages_discourse_aware_debug_path is not None:
+        if include_passages_discourse_aware or include_passages_discourse_aware_debug:
+            done_discourse_pids, _ = compute_resume_sets(
+                resume=resume,
+                out_path=passages_discourse_aware_path,
+                items=iter_discourse_pids(),
+                get_id=lambda pid, i: pid,
+                phase_label=f"{dataset} {split} discourse-aware passages",
+                id_field="passage_id",
+            )
+        if include_passages_discourse_aware_debug and passages_discourse_aware_debug_path is not None:
             done_discourse_debug_pids = (
                 existing_ids(passages_discourse_aware_debug_path, id_field="passage_id")
                 if resume
                 else set()
             )
-        if passages_discourse_aware_aliases_path is not None:
+        if include_passages_discourse_aware_aliases and passages_discourse_aware_aliases_path is not None:
             done_discourse_aliases = (
                 existing_ids(
                     passages_discourse_aware_aliases_path,
@@ -478,7 +985,7 @@ def process_dataset(
                 if resume
                 else set()
             )
-        if full_passages_chunks_discourse_aware_debug_path is not None:
+        if include_full_passages_chunks_discourse_aware_debug and full_passages_chunks_discourse_aware_debug_path is not None:
             done_full_da_chunk_debug_pids = (
                 existing_ids(
                     full_passages_chunks_discourse_aware_debug_path,
@@ -491,7 +998,7 @@ def process_dataset(
     # ---- Write processed files ---------------------------------------------
     for ex in examples:
         qid = get_id(ex)
-        if qid not in done_qids:
+        if include_questions and qid not in done_qids:
             gold_ids, seen = [], set()
             for pid in gold_ids_fn(ex):
                 if pid not in seen:
@@ -514,23 +1021,24 @@ def process_dataset(
                 record["gold_passages_full"] = gold_full_ids
             append_jsonl(qa_path, record)
 
-        for pid, title, text in iter_passages_fn(ex):
-            if pid in done_pids:
-                continue
-            append_jsonl(
-                passages_path,
-                {
-                    "passage_id": pid,
-                    "title": title,
-                    "text": clean_text(text),
-                },
-            )
+        if include_passages:
+            for pid, title, text in iter_passages_fn(ex):
+                if pid in done_pids:
+                    continue
+                append_jsonl(
+                    passages_path,
+                    {
+                        "passage_id": pid,
+                        "title": title,
+                        "text": clean_text(text),
+                    },
+                )
 
-        if iter_full_passages_fn is None or full_passages_path is None:
+        if iter_full_passages_fn is None or not any_full_outputs:
             continue
         for pid, title, text in iter_full_passages_fn(ex):
             cleaned = clean_text(text)
-            if pid not in done_full_pids:
+            if include_full_passages and pid not in done_full_pids:
                 append_jsonl(
                     full_passages_path,
                     {
@@ -539,7 +1047,7 @@ def process_dataset(
                         "text": cleaned,
                     },
                 )
-            if passages_discourse_aware_path is not None:
+            if include_discourse_outputs:
                 sentences = [s.strip() for _, _, s in iter_sentence_spans(cleaned)]
                 expanded_entries: List[Dict[str, object]] = []
                 covered_by_expansion: set[int] = set()
@@ -584,7 +1092,7 @@ def process_dataset(
                     passage_id = f"{base}__sent{idx}"
                     anchor_idx = cover_anchor.get(idx)
                     if not expanded and anchor_idx is not None and anchor_idx != idx:
-                        if passages_discourse_aware_aliases_path is not None:
+                        if include_passages_discourse_aware_aliases:
                             if passage_id not in done_discourse_aliases:
                                 kept_id = f"{base}__sent{anchor_idx}"
                                 append_jsonl(
@@ -599,22 +1107,23 @@ def process_dataset(
                                 )
                                 done_discourse_aliases.add(passage_id)
                         continue
-                    if passage_id in done_discourse_pids:
-                        continue
-                    append_jsonl(
-                        passages_discourse_aware_path,
-                        {
-                            "passage_id": passage_id,
-                            "source_id": pid,
-                            "expanded": expanded,
-                            "title": title,
-                            "text": str(entry["text"]),
-                        },
-                    )
-                    done_discourse_pids.add(passage_id)
+                    if include_passages_discourse_aware:
+                        if passage_id in done_discourse_pids:
+                            continue
+                        append_jsonl(
+                            passages_discourse_aware_path,
+                            {
+                                "passage_id": passage_id,
+                                "source_id": pid,
+                                "expanded": expanded,
+                                "title": title,
+                                "text": str(entry["text"]),
+                            },
+                        )
+                        done_discourse_pids.add(passage_id)
                     if (
-                        expanded
-                        and passages_discourse_aware_debug_path is not None
+                        include_passages_discourse_aware_debug
+                        and expanded
                         and passage_id not in done_discourse_debug_pids
                     ):
                         append_jsonl(
@@ -631,123 +1140,125 @@ def process_dataset(
                             },
                         )
                         done_discourse_debug_pids.add(passage_id)
-            if full_passages_chunks_path is None:
-                continue
-            chunks = split_long_passage(cleaned)
-            if not chunks:
-                continue
-            if len(chunks) == 1:
-                chunk_id = pid
-                if chunk_id in done_full_chunk_pids:
-                    continue
-                append_jsonl(
-                    full_passages_chunks_path,
-                    {
-                        "passage_id": chunk_id,
-                        "source_id": pid,
-                        "chunk_index": 0,
-                        "chunk_count": 1,
-                        "title": title,
-                        "text": chunks[0],
-                    },
-                )
-            else:
-                for idx, chunk_text in enumerate(chunks):
-                    chunk_id = f"{pid}__chunk{idx}"
-                    if chunk_id in done_full_chunk_pids:
-                        continue
-                    append_jsonl(
-                        full_passages_chunks_path,
-                        {
-                            "passage_id": chunk_id,
-                            "source_id": pid,
-                            "chunk_index": idx,
-                            "chunk_count": len(chunks),
-                            "title": title,
-                            "text": chunk_text,
-                        },
-                    )
+            if include_full_passages_chunks:
+                chunks = split_long_passage(cleaned)
+                if chunks:
+                    if len(chunks) == 1:
+                        chunk_id = pid
+                        if chunk_id not in done_full_chunk_pids:
+                            append_jsonl(
+                                full_passages_chunks_path,
+                                {
+                                    "passage_id": chunk_id,
+                                    "source_id": pid,
+                                    "chunk_index": 0,
+                                    "chunk_count": 1,
+                                    "title": title,
+                                    "text": chunks[0],
+                                },
+                            )
+                    else:
+                        for idx, chunk_text in enumerate(chunks):
+                            chunk_id = f"{pid}__chunk{idx}"
+                            if chunk_id in done_full_chunk_pids:
+                                continue
+                            append_jsonl(
+                                full_passages_chunks_path,
+                                {
+                                    "passage_id": chunk_id,
+                                    "source_id": pid,
+                                    "chunk_index": idx,
+                                    "chunk_count": len(chunks),
+                                    "title": title,
+                                    "text": chunk_text,
+                                },
+                            )
 
-            if full_passages_chunks_discourse_aware_path is None:
-                continue
-            da_chunks, da_extended_flags = split_long_passage_discourse_aware_with_flags(
-                cleaned
-            )
-            if not da_chunks:
-                continue
-            if len(da_chunks) == 1:
-                chunk_id = pid
-                if chunk_id in done_full_da_chunk_pids:
-                    continue
-                append_jsonl(
-                    full_passages_chunks_discourse_aware_path,
-                    {
-                        "passage_id": chunk_id,
-                        "source_id": pid,
-                        "chunk_index": 0,
-                        "chunk_count": 1,
-                        "title": title,
-                        "text": da_chunks[0],
-                    },
+            if include_da_chunk_outputs:
+                da_chunks, da_extended_flags = (
+                    split_long_passage_discourse_aware_with_flags(cleaned)
                 )
-                done_full_da_chunk_pids.add(chunk_id)
-                if (
-                    full_passages_chunks_discourse_aware_debug_path is not None
-                    and chunk_id not in done_full_da_chunk_debug_pids
-                ):
-                    extended = bool(da_extended_flags[0]) if da_extended_flags else False
-                    if not extended:
-                        continue
-                    append_jsonl(
-                        full_passages_chunks_discourse_aware_debug_path,
-                        {
-                            "passage_id": chunk_id,
-                            "source_id": pid,
-                            "chunk_index": 0,
-                            "chunk_count": 1,
-                            "title": title,
-                            "text": da_chunks[0],
-                            "extended": True,
-                        },
-                    )
-                    done_full_da_chunk_debug_pids.add(chunk_id)
-                continue
-            for idx, chunk_text in enumerate(da_chunks):
-                chunk_id = f"{pid}__chunk{idx}"
-                if chunk_id in done_full_da_chunk_pids:
+                if not da_chunks:
                     continue
-                append_jsonl(
-                    full_passages_chunks_discourse_aware_path,
-                    {
-                        "passage_id": chunk_id,
-                        "source_id": pid,
-                        "chunk_index": idx,
-                        "chunk_count": len(da_chunks),
-                        "title": title,
-                        "text": chunk_text,
-                    },
-                )
-                done_full_da_chunk_pids.add(chunk_id)
-                if (
-                    full_passages_chunks_discourse_aware_debug_path is not None
-                    and chunk_id not in done_full_da_chunk_debug_pids
-                ):
-                    extended = idx < len(da_extended_flags) and da_extended_flags[idx]
-                    if not extended:
-                        continue
-                    append_jsonl(
-                        full_passages_chunks_discourse_aware_debug_path,
-                        {
-                            "passage_id": chunk_id,
-                            "source_id": pid,
-                            "chunk_index": idx,
-                            "chunk_count": len(da_chunks),
-                            "title": title,
-                            "text": chunk_text,
-                            "extended": True,
-                        },
-                    )
-                    done_full_da_chunk_debug_pids.add(chunk_id)
+                if len(da_chunks) == 1:
+                    chunk_id = pid
+                    if (
+                        include_full_passages_chunks_discourse_aware
+                        and chunk_id not in done_full_da_chunk_pids
+                    ):
+                        append_jsonl(
+                            full_passages_chunks_discourse_aware_path,
+                            {
+                                "passage_id": chunk_id,
+                                "source_id": pid,
+                                "chunk_index": 0,
+                                "chunk_count": 1,
+                                "title": title,
+                                "text": da_chunks[0],
+                            },
+                        )
+                        done_full_da_chunk_pids.add(chunk_id)
+                    if (
+                        include_full_passages_chunks_discourse_aware_debug
+                        and chunk_id not in done_full_da_chunk_debug_pids
+                    ):
+                        extended = (
+                            bool(da_extended_flags[0]) if da_extended_flags else False
+                        )
+                        if not extended:
+                            continue
+                        append_jsonl(
+                            full_passages_chunks_discourse_aware_debug_path,
+                            {
+                                "passage_id": chunk_id,
+                                "source_id": pid,
+                                "chunk_index": 0,
+                                "chunk_count": 1,
+                                "title": title,
+                                "text": da_chunks[0],
+                                "extended": True,
+                            },
+                        )
+                        done_full_da_chunk_debug_pids.add(chunk_id)
+                    continue
+                for idx, chunk_text in enumerate(da_chunks):
+                    chunk_id = f"{pid}__chunk{idx}"
+                    if (
+                        include_full_passages_chunks_discourse_aware
+                        and chunk_id not in done_full_da_chunk_pids
+                    ):
+                        append_jsonl(
+                            full_passages_chunks_discourse_aware_path,
+                            {
+                                "passage_id": chunk_id,
+                                "source_id": pid,
+                                "chunk_index": idx,
+                                "chunk_count": len(da_chunks),
+                                "title": title,
+                                "text": chunk_text,
+                            },
+                        )
+                        done_full_da_chunk_pids.add(chunk_id)
+                    if (
+                        include_full_passages_chunks_discourse_aware_debug
+                        and chunk_id not in done_full_da_chunk_debug_pids
+                    ):
+                        extended = idx < len(da_extended_flags) and da_extended_flags[idx]
+                        if not extended:
+                            continue
+                        append_jsonl(
+                            full_passages_chunks_discourse_aware_debug_path,
+                            {
+                                "passage_id": chunk_id,
+                                "source_id": pid,
+                                "chunk_index": idx,
+                                "chunk_count": len(da_chunks),
+                                "title": title,
+                                "text": chunk_text,
+                                "extended": True,
+                            },
+                        )
+                        done_full_da_chunk_debug_pids.add(chunk_id)
 
 
 ##### Ingestion pipeline helpers
@@ -760,6 +1271,7 @@ def _run_ingestion(
     *,
     max_examples: int | None = None,
     resume: bool = True,
+    include_outputs: Iterable[str] | None = None,
 ) -> None:
     config = DATASET_CONFIGS.get(dataset)
     if config is None:
@@ -779,6 +1291,7 @@ def _run_ingestion(
         field_map=field_map,
         max_examples=max_examples,
         resume=resume,
+        include_outputs=include_outputs,
     )
 
 

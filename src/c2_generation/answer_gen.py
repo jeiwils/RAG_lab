@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
@@ -9,6 +10,11 @@ from typing import Dict, List, Optional, Tuple
 import networkx as nx
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try:  # optional dependency
+    import tiktoken  # type: ignore
+except Exception:  # pragma: no cover - fallback when tiktoken missing
+    tiktoken = None  # type: ignore
 
 from src.d1_evaluation.answer_metrics import normalise_answer
 from src.utils.x_config import MAX_TOKENS, TEMPERATURE
@@ -19,6 +25,45 @@ __all__ = [
     "extract_final_answer",
     "post_process_answer",
 ]
+
+DEFAULT_MAX_CONTEXT_TOKENS = int(os.environ.get("LLM_CONTEXT_WINDOW", "4096"))
+DEFAULT_CONTEXT_SAFETY_MARGIN = int(os.environ.get("LLM_CONTEXT_SAFETY_MARGIN", "128"))
+DEFAULT_MAX_PASSAGE_TOKENS = int(os.environ.get("MAX_PASSAGE_TOKENS", "512"))
+
+
+@lru_cache(maxsize=4)
+def _get_encoding(model_name: str):
+    if tiktoken is None:
+        return None
+    try:
+        return tiktoken.encoding_for_model(model_name)
+    except Exception:
+        return tiktoken.get_encoding("cl100k_base")
+
+
+def _estimate_tokens(text: str, model_name: str) -> int:
+    if not text:
+        return 0
+    enc = _get_encoding(model_name)
+    if enc is not None:
+        return len(enc.encode(text))
+    # Rough fallback: inflate word count to reduce risk of exceeding context.
+    return int(len(text.split()) * 1.3) + 1
+
+
+def _truncate_to_token_budget(text: str, budget: int, model_name: str) -> str:
+    if budget <= 0 or not text:
+        return ""
+    enc = _get_encoding(model_name)
+    if enc is not None:
+        tokens = enc.encode(text)
+        if len(tokens) <= budget:
+            return text
+        return enc.decode(tokens[:budget]).strip()
+    words = text.split()
+    if len(words) <= budget:
+        return text
+    return " ".join(words[:budget]).strip()
 
 
 def extract_final_answer(raw: str) -> str:
@@ -85,6 +130,8 @@ def ask_llm_with_passages(
     model_name: str = "",
     top_k_answer_passages: int = 20,
     seed: int | None = None,
+    max_context_tokens: int | None = None,
+    max_passage_tokens: int | None = None,
     *,
     in_process: bool = False,
     local_files_only: bool = True,
@@ -102,16 +149,49 @@ def ask_llm_with_passages(
 
         passage_texts.append(passage)
 
-    prompt = (
+    base_prompt = (
         "Context information is below.\n"
         "-----------------------\n"
-        + "\n\n".join(passage_texts)
-        + "\n-----------------------\n"
+        "{context}\n"
+        "-----------------------\n"
         "Given the context information and not prior knowledge, answer the query. "
         "Do not provide any explanation.\n"
         f"Query: {query_text}\n"
         "Answer:"
     )
+
+    context_window = max_context_tokens or DEFAULT_MAX_CONTEXT_TOKENS
+    passage_token_cap = (
+        DEFAULT_MAX_PASSAGE_TOKENS if max_passage_tokens is None else max_passage_tokens
+    )
+    reserved_for_output = min(max_tokens, 256)
+    prompt_budget = max(
+        0, context_window - reserved_for_output - DEFAULT_CONTEXT_SAFETY_MARGIN
+    )
+    base_tokens = _estimate_tokens(base_prompt.format(context=""), model_name)
+    context_budget = max(prompt_budget - base_tokens, 0)
+
+    selected_passages: List[str] = []
+    used_tokens = 0
+    for passage in passage_texts:
+        text = passage.strip()
+        if not text:
+            continue
+        if passage_token_cap is not None and passage_token_cap > 0:
+            text = _truncate_to_token_budget(text, passage_token_cap, model_name)
+        est_tokens = _estimate_tokens(text, model_name)
+        sep_tokens = 2
+        if used_tokens + est_tokens + sep_tokens > context_budget:
+            remaining = context_budget - used_tokens - sep_tokens
+            if not selected_passages and remaining > 0:
+                trimmed = _truncate_to_token_budget(text, remaining, model_name)
+                if trimmed:
+                    selected_passages.append(trimmed)
+            break
+        selected_passages.append(text)
+        used_tokens += est_tokens + sep_tokens
+
+    prompt = base_prompt.format(context="\n\n".join(selected_passages))
 
     raw = ""
     raw_clean = ""

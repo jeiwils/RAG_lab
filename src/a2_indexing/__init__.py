@@ -16,6 +16,7 @@ from src.a2_indexing.discourse_aware_chunking import (
     chunk_records as discourse_aware_chunk_records,
     chunk_text as discourse_aware_chunk_text,
 )
+from src.a2_indexing.splits import carve_validation_split
 
 __all__ = [
     "Chunk",
@@ -29,5 +30,6 @@ __all__ = [
     "discourse_aware_chunk_record",
     "discourse_aware_chunk_records",
     "discourse_aware_chunk_text",
+    "carve_validation_split",
     "make_chunk_id",
 ]

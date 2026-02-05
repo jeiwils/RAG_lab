@@ -15,6 +15,10 @@ from transformers import AutoModelForSequenceClassification
 from src.d1_evaluation.classification_metrics import binary_f1
 
 __all__ = [
+    "DEFAULT_TAU_MIN",
+    "DEFAULT_TAU_MAX",
+    "DEFAULT_TAU_STEPS",
+    "DEFAULT_PRECISION_TARGET",
     "evaluate_and_choose_tau",
     "find_attention_projection_modules",
     "init_model_with_lora",
@@ -27,6 +31,12 @@ __all__ = [
 ]
 
 T = TypeVar("T")
+
+# Tau selection configuration (centralized here).
+DEFAULT_TAU_MIN = 0.3
+DEFAULT_TAU_MAX = 0.9
+DEFAULT_TAU_STEPS = 81
+DEFAULT_PRECISION_TARGET = 0.80
 
 
 def find_attention_projection_modules(model) -> List[str]:
@@ -210,6 +220,8 @@ def evaluate_and_choose_tau(
     encode_kwargs: Dict[str, Any] | None = None,
     thresholds: torch.Tensor | None = None,
     include_confusion: bool = False,
+    pos_weight: float | None = None,
+    precision_target: float | None = None,
 ):
     """Evaluate on dev set and choose the best decision threshold."""
     if encode_batch_fn is None:
@@ -219,7 +231,14 @@ def evaluate_and_choose_tau(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if thresholds is None:
-        thresholds = torch.linspace(0.1, 0.9, steps=81)
+        thresholds = torch.linspace(
+            DEFAULT_TAU_MIN,
+            DEFAULT_TAU_MAX,
+            steps=DEFAULT_TAU_STEPS,
+        )
+    # For precision-target selection we want smallest tau that meets target,
+    # so evaluate thresholds in ascending order.
+    thresholds = torch.sort(thresholds).values
 
     encode_kwargs = encode_kwargs or {}
 
@@ -238,22 +257,67 @@ def evaluate_and_choose_tau(
     if not all_logits:
         return {"dev_f1": 0.0, "tau": 0.5, "dev_examples": 0}
 
-    probs = torch.sigmoid(torch.cat(all_logits, dim=0))
+    logits = torch.cat(all_logits, dim=0)
+    probs = torch.sigmoid(logits)
     gold = torch.cat(all_labels, dim=0)
+
+    if pos_weight is None:
+        dev_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, gold
+        ).item()
+    else:
+        weight_tensor = torch.tensor([pos_weight], device=logits.device)
+        dev_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, gold, pos_weight=weight_tensor
+        ).item()
 
     best_tau = 0.5
     best_score = -1.0
+    best_precision = 0.0
+    best_recall = 0.0
+
+    if precision_target is None:
+        precision_target = DEFAULT_PRECISION_TARGET
+    if precision_target is not None:
+        precision_target = float(precision_target)
     for tau in thresholds:
         preds = probs >= tau
         score = binary_f1(preds, gold)
-        if score > best_score:
-            best_score = score
-            best_tau = float(tau.item())
+        tp = int(((preds == 1) & (gold == 1)).sum().item())
+        fp = int(((preds == 1) & (gold == 0)).sum().item())
+        fn = int(((preds == 0) & (gold == 1)).sum().item())
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+
+        if precision_target is not None:
+            if precision >= precision_target:
+                # smallest tau that reaches target precision
+                best_tau = float(tau.item())
+                best_score = score
+                best_precision = precision
+                best_recall = recall
+                break
+            # track best precision so far in case target is never met
+            if precision > best_precision:
+                best_precision = precision
+                best_recall = recall
+                best_tau = float(tau.item())
+                best_score = score
+        else:
+            if score > best_score:
+                best_score = score
+                best_tau = float(tau.item())
+                best_precision = precision
+                best_recall = recall
 
     metrics = {
         "dev_f1": float(best_score),
+        "dev_loss": float(dev_loss),
         "tau": best_tau,
         "dev_examples": int(gold.numel()),
+        "dev_precision": float(best_precision),
+        "dev_recall": float(best_recall),
+        "precision_target": precision_target,
     }
 
     if include_confusion:

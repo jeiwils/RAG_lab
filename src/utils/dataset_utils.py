@@ -77,7 +77,7 @@ def _resolve_aliases_path(
 def load_dataset_split(
     split: str,
     *,
-    dataset: str = "hotpotqa",
+    dataset: str,
     questions_path: str | Path | None = None,
     passages_path: str | Path | None = None,
     passages_aliases_path: str | Path | None = None,

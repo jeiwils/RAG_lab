@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import unicodedata
 from multiprocessing import Pool, Process
@@ -205,6 +206,30 @@ def load_jsonl(path: str, log_skipped: bool = False) -> Iterator[Dict]:
                     print(f"Skipping malformed JSON on line {line_no} in {path}")
     if log_skipped and skipped:
         print(f"Skipped {skipped} empty or malformed lines in {path}")
+
+def limit_questions(
+    questions: List[Dict[str, Any]],
+    *,
+    max_questions: int | None,
+    seed: int | None = None,
+    shuffle: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return a list of questions capped at ``max_questions``.
+
+    When ``shuffle`` is True, a seeded shuffle is applied before truncation.
+    """
+    if max_questions is None:
+        return questions
+    if max_questions <= 0:
+        return []
+    if len(questions) <= max_questions:
+        return questions
+    if shuffle: 
+        rng = random.Random(seed)
+        indices = list(range(len(questions)))
+        rng.shuffle(indices)
+        return [questions[i] for i in indices[:max_questions]]
+    return questions[:max_questions]
 
 def save_jsonl(path: str, data: List[Dict]) -> None:
     """Write a list of dictionaries to a JSONL file."""
@@ -645,6 +670,7 @@ __all__ = [
     "validate_vec_ids",
     "compute_resume_sets",
     "load_jsonl",
+    "limit_questions",
     "save_jsonl",
     "append_jsonl",
     "save_jsonl_safely",

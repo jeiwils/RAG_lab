@@ -23,7 +23,5 @@ def dataset_rep_paths(
     return {
         "passages_jsonl": os.path.join(base, f"{dataset}{suffix}_passages.jsonl"),
         "passages_emb": os.path.join(base, f"{dataset}{suffix}_passages_emb.npy"),
-        "passages_index": os.path.join(
-            base, f"{dataset}{suffix}_faiss_passages.faiss"
-        ),
+        "passages_index": os.path.join(base, f"{dataset}_faiss_passages.faiss"),
     }

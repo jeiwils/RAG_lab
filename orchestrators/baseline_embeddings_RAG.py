@@ -62,22 +62,24 @@ __all__ = ["run_baseline_rag", "run_dense_rag"]
 # ---------------------------------------------------------------------------
 
 # Defaults used by run_baseline_rag
-TOP_K_SWEEP = [5] # [1, 5, 10, 20]
+TOP_K_SWEEP = [1, 5, 10, 20]
 RETRIEVER_CONFIG = {
-    "dense": True,
-    "sparse": True,
+    "dense": False,
+    "sparse": False,
     "hybrid": True,
 }
 
 # Defaults used by main()
-DATASETS = ["hotpotqa", "2wikimultihopqa", "musique"]
+DATASETS = ["hotpotqa"] #["hotpotqa", "2wikimultihopqa", "musique", "natural_questions"]
 # Use val for tuning, dev for final metrics.
-SPLITS = ["val", "dev"]
+SPLITS = ["dev"] #["val", "dev"]
 READER_MODELS = ["Qwen/Qwen2.5-7B-Instruct"]
 SERVER_URL = "http://localhost:8005"
-SEEDS = [1] #[1, 2, 3]
-MAX_QUESTIONS: int | None = 100  # set to None to use the full split
+SEEDS = [1, 2, 3] # [1] #
+MAX_QUESTIONS: int | None = 1000  # set to None to use the full split
 SHUFFLE_QUESTIONS = False
+# Passage source config (default is sentence-level passages).
+PASSAGE_SOURCE = "full_passages_chunks"  # "passages" | "full_passages_chunks" | "full_passages_chunks_discourse_aware"
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -94,6 +96,7 @@ def run_baseline_rag(
     alpha: float = DEFAULT_HYBRID_ALPHA,
     seed: int | None = None,
     resume: bool = False,
+    passage_source: str = "passages",
 ) -> Dict[str, Any]:
     """Answer queries using dense/sparse/hybrid retrieval over passages and evaluate EM/F1.
 
@@ -131,6 +134,10 @@ def run_baseline_rag(
         skipping already processed questions. When ``True``,
         :func:`src.utils.compute_resume_sets` determines which question IDs
         have been completed.
+    passage_source: str, optional
+        Passage source to load representations from. Use ``"passages"`` for
+        sentence-level passages or ``"full_passages_chunks"`` to match the
+        DA_EXIT chunk retrieval unit.
 
     Returns
     -------
@@ -151,7 +158,7 @@ def run_baseline_rag(
     if server_url is None:
         server_url = get_server_configs(reader_model)[0]["server_url"]
 
-    rep_paths = dataset_rep_paths(dataset, split)
+    rep_paths = dataset_rep_paths(dataset, split, passage_source=passage_source)
     passages = list(load_jsonl(rep_paths["passages_jsonl"]))
     passage_lookup = {p["passage_id"]: p["text"] for p in passages}
     index = None
@@ -168,7 +175,11 @@ def run_baseline_rag(
         shuffle=SHUFFLE_QUESTIONS,
     )
 
-    variant = retriever if seed is None else f"{retriever}_seed{seed}"
+    variant = f"{retriever}_k{top_k}"
+    if passage_source and passage_source != "passages":
+        variant = f"{variant}_{passage_source}"
+    if seed is not None:
+        variant = f"{variant}_seed{seed}"
     paths = get_result_paths(reader_model, dataset, split, variant)
 
     done_ids, _ = compute_resume_sets(
@@ -235,12 +246,20 @@ def run_baseline_rag(
                 top_k_answer_passages=top_k,
                 seed=seed,
             )
-            return passage_ids, hits_val, recall_val, llm_out, reader_elapsed_sec
+            return (
+                passage_ids,
+                hits_val,
+                recall_val,
+                precision_val,
+                llm_out,
+                reader_elapsed_sec,
+            )
 
         (
             passage_ids,
             hits_val,
             recall_val,
+            precision_val,
             llm_out,
             reader_elapsed_sec,
         ), query_wall_sec = wall_time(_run_query)
@@ -400,6 +419,8 @@ def run_baseline_rag(
             "variant": variant,
             "retriever": retriever,
             "reader_model": reader_model,
+            "passage_source": passage_source,
+            "top_k": top_k,
             "n_chunks": len(passages),
             "queries_total": queries_total,
             "timestamp": now_ts,
@@ -489,6 +510,7 @@ def main() -> None:
                                 alpha=DEFAULT_HYBRID_ALPHA,
                                 seed=seed,
                                 resume=True,
+                                passage_source=PASSAGE_SOURCE,
                             )
                             print(metrics)
     print("\nBaseline RAG complete.")

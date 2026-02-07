@@ -113,12 +113,12 @@ __all__ = ["run_da_exit", "main"]
 # ---------------------------------------------------------------------------
 
 # Sentence usefulness cutoff (set from best_metrics.json of chosen LoRA model)
-TAU_LOW = 0.58 # CHANGE THIS TO TAU_THRESHOLD 
+TAU_LOW = 0.2 # CHANGE THIS TO TAU_THRESHOLD 
 # Total token budget for selected sentences (adjust for reader context size).
 
-DATASETS = ["musique", "hotpotqa", "2wikimultihopqa", "natural_questions"]
+DATASETS = ["hotpotqa"] #["musique", "hotpotqa", "2wikimultihopqa", "natural_questions"]
 # Use val for tuning, dev for final metrics.
-SPLITS = ["val", "dev"]
+SPLITS = ["dev"] # ["val", "dev"]
 RETRIEVER_CONFIG = {
     "hybrid": True,
     "dense": False,
@@ -129,24 +129,25 @@ RETRIEVER_CONFIG = {
 CHUNKING_MODE = "standard_chunks"  # "standard_chunks" | "discourse_aware_chunks"
 # Sentence mode controls post-ranking expansion for the reader context.
 # "standard_sentences" = no expansion; "discourse_aware_sentences" = expand after ranking.
-SENTENCE_MODES = ["standard_sentences", "discourse_aware_sentences"]
+SENTENCE_MODES = ["discourse_aware_sentences"] #["standard_sentences"] #["standard_sentences", "discourse_aware_sentences"]
 
 
 SENTENCE_TOKEN_BUDGET = 512
-TOP_K_CHUNK_SWEEP = [1, 5, 10, 20]
+TOP_K_CHUNK_SWEEP = [10, 5, 20, 1] 
 HYBRID_ALPHA = DEFAULT_HYBRID_ALPHA ## ????
 
 IN_PROCESS_READER_LOCAL_FILES_ONLY = True
 SENTENCE_GRADER_MODEL = (
     "data/models/useful_sentence_lora/grid/"
-    "run4_hn6_rn1_pw2.0_lr3e-05_ep8_r8_a16_d0.05_bs16/checkpoint-epoch8"
+    "run3_transfer_underfit_hn8_rn2_pw1.0_lr3e-05_ep2_r16_a16_d0.05_bs16_wd0.01/"
+    "checkpoint-epoch2"
 )
 SENTENCE_LORA_BATCH_SIZE = 32
 SENTENCE_LORA_MAX_LEN = DEFAULT_MAX_LEN
 SENTENCE_LORA_LOCAL_FILES_ONLY = True
 
-SEEDS = [1] #[1, 2, 3]
-MAX_QUESTIONS: int | None = 100  # set to None to use the full split
+SEEDS = [1, 2, 3] # [1] #
+MAX_QUESTIONS: int | None = 1000  # set to None to use the full split
 SHUFFLE_QUESTIONS = False
 RESUME = True
 

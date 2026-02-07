@@ -39,11 +39,11 @@ from src.utils.__utils__ import (
 
 # Config
 DATASETS_TO_PREPROCESS = [
-    "musique",
+    #"musique",
     "hotpotqa",
-    "2wikimultihopqa",
-    "natural_questions",
-    "acord",
+    #"2wikimultihopqa",
+    #"natural_questions",
+    #"acord",
     #"fever",
 ]
 
@@ -52,8 +52,8 @@ DATASETS_TO_PREPROCESS = [
 # change to train, hotpotqa, 25000
 
 RESUME = True
-SPLITS = ["train", "dev"]
-MAX_ROWS = 5000  # set to an int to cap rows per split
+SPLITS = ["train"] # ["dev"] #["train", "dev"]
+MAX_ROWS = 25000  # set to an int to cap rows per split
 
 
 TO_PREPROCESS = ['passages', 'questions', 'full_passages', 'full_passages_chunks']
@@ -738,6 +738,9 @@ def main() -> None:
 
         if CARVE_VAL_SPLIT and VAL_SOURCE_SPLIT in SPLITS:
             try:
+                passage_id_split_token = (
+                    "_sent" if dataset == "musique" else "__"
+                )
                 results = carve_validation_split(
                     dataset=dataset,
                     source_split=VAL_SOURCE_SPLIT,
@@ -748,6 +751,7 @@ def main() -> None:
                     seed=VAL_SEED,
                     shuffle=VAL_SHUFFLE,
                     max_questions=VAL_MAX_QUESTIONS,
+                    passage_id_split_token=passage_id_split_token,
                     include_outputs=list(include_outputs),
                     overwrite=VAL_OVERWRITE,
                 )

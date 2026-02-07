@@ -43,7 +43,7 @@ USE_DISCOURSE_AWARE_PASSAGES = False
 
 USE_STRATIFIED_BATCHING = False
 DEFAULT_SEED = 1
-RUN_GRID_SEARCH = True
+RUN_GRID_SEARCH = False
 
 
 
@@ -97,16 +97,16 @@ DEFAULT_BATCH_SIZE = 16
 
 
 BEST_GRID_RUN_KWARGS = {
-    "hard_negatives": 6,
+    "hard_negatives": 8,
     "random_negatives": 2,
     "pos_weight": 1.0,
-    "lr": 2e-5,
+    "lr": 3e-5,
     "num_epochs": 2,
-    "lora_r": 8,
+    "lora_r": 16,
     "lora_alpha": 16,
     "lora_dropout": 0.05,
     "batch_size": 16,
-    "weight_decay": 0.05,
+    "weight_decay": 0.01,
 }
 
 GRID_CONFIGS = [
@@ -444,8 +444,11 @@ def train(
         neg = max(len(train_examples) - pos, 0)
         pos_weight = (neg / max(pos, 1)) if train_examples else 1.0
 
+    # Fast tokenizers trigger a hub lookup in some versions when offline.
     tokenizer = AutoTokenizer.from_pretrained(
-        base_model_name, local_files_only=local_files_only
+        base_model_name,
+        local_files_only=local_files_only,
+        use_fast=not local_files_only,
     )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token

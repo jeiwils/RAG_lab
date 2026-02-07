@@ -28,7 +28,10 @@ from src.a3_representations.dense_representations import (
 )
 from src.a3_representations.representations_paths import dataset_rep_paths
 from src.b1_retrieval import DEFAULT_HYBRID_ALPHA
-from src.c2_generation.answer_gen import ask_llm_with_passages
+from src.c2_generation.answer_gen import (
+    ask_llm_with_passages,
+    compute_max_context_tokens,
+)
 from src.d1_evaluation.answer_metrics import (
     aggregate_answer_scores,
     evaluate_answers,
@@ -54,32 +57,49 @@ from src.utils.__utils__ import (
     processed_dataset_paths,
     save_jsonl,
 )
+from src.utils.x_config import MAX_TOKENS
 
 __all__ = ["run_baseline_rag", "run_dense_rag"]
 
 # ---------------------------------------------------------------------------
-# #### Configs
+# Config
 # ---------------------------------------------------------------------------
 
-# Defaults used by run_baseline_rag
-TOP_K_SWEEP = [1, 5, 10, 20]
+### DATA & SPLITS
+DATASETS = ["musique"] #["hotpotqa", "2wikimultihopqa", "musique", "natural_questions"]
+# Use val for tuning, dev for final metrics.
+SPLITS = ["val"] #["val", "dev"]
+
+### RETRIEVAL & PASSAGE
 RETRIEVER_CONFIG = {
     "dense": False,
     "sparse": False,
     "hybrid": True,
 }
-
-# Defaults used by main()
-DATASETS = ["hotpotqa"] #["hotpotqa", "2wikimultihopqa", "musique", "natural_questions"]
-# Use val for tuning, dev for final metrics.
-SPLITS = ["dev"] #["val", "dev"]
-READER_MODELS = ["Qwen/Qwen2.5-7B-Instruct"]
-SERVER_URL = "http://localhost:8005"
-SEEDS = [1, 2, 3] # [1] #
-MAX_QUESTIONS: int | None = 1000  # set to None to use the full split
-SHUFFLE_QUESTIONS = False
+TOP_K_CHUNK_SWEEP = [1, 5, 10, 20]
+HYBRID_ALPHA = DEFAULT_HYBRID_ALPHA
 # Passage source config (default is sentence-level passages).
 PASSAGE_SOURCE = "full_passages_chunks"  # "passages" | "full_passages_chunks" | "full_passages_chunks_discourse_aware"
+
+### SELECTION & BUDGETS
+# Optional reader context budget to align with DA_EXIT sentence budgets.
+APPLY_READER_TOKEN_BUDGET = True
+# Total token budget for all passages combined (approximate, excludes output tokens).
+READER_CONTEXT_BUDGET_TOKENS = 800
+# Optional per-passage cap; set to None to disable per-passage truncation.
+READER_MAX_PASSAGE_TOKENS: int | None = None
+
+### READER
+READER_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+SERVER_URL = "http://localhost:8005"
+
+
+### RUN CONTROL
+SEEDS = [1, 2, 3] # [1] #
+MAX_QUESTIONS: int | None = 100  # set to None to use the full split
+SHUFFLE_QUESTIONS = False
+RESUME = True
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -93,7 +113,7 @@ def run_baseline_rag(
     retriever: str,
     server_url: str | None = None,
     top_k: int = 20,
-    alpha: float = DEFAULT_HYBRID_ALPHA,
+    alpha: float = HYBRID_ALPHA,
     seed: int | None = None,
     resume: bool = False,
     passage_source: str = "passages",
@@ -178,6 +198,10 @@ def run_baseline_rag(
     variant = f"{retriever}_k{top_k}"
     if passage_source and passage_source != "passages":
         variant = f"{variant}_{passage_source}"
+    if APPLY_READER_TOKEN_BUDGET:
+        variant = f"{variant}_budget{READER_CONTEXT_BUDGET_TOKENS}"
+        if READER_MAX_PASSAGE_TOKENS is not None:
+            variant = f"{variant}_ptok{READER_MAX_PASSAGE_TOKENS}"
     if seed is not None:
         variant = f"{variant}_seed{seed}"
     paths = get_result_paths(reader_model, dataset, split, variant)
@@ -235,6 +259,17 @@ def run_baseline_rag(
             hits_val = compute_hits_at_k(passage_ids, gold_passages, top_k)
             recall_val = compute_recall_at_k(passage_ids, gold_passages, top_k)
             precision_val = compute_precision_at_k(passage_ids, gold_passages, top_k)
+            max_context_tokens = None
+            max_passage_tokens = None
+            if APPLY_READER_TOKEN_BUDGET:
+                max_context_tokens = compute_max_context_tokens(
+                    q_text,
+                    reader_model,
+                    READER_CONTEXT_BUDGET_TOKENS,
+                    MAX_TOKENS["answer_generation"],
+                )
+                max_passage_tokens = READER_MAX_PASSAGE_TOKENS
+
             llm_out, reader_elapsed_sec = wall_time(
                 ask_llm_with_passages,
                 query_text=q_text,
@@ -245,6 +280,8 @@ def run_baseline_rag(
                 model_name=reader_model,
                 top_k_answer_passages=top_k,
                 seed=seed,
+                max_context_tokens=max_context_tokens,
+                max_passage_tokens=max_passage_tokens,
             )
             return (
                 passage_ids,
@@ -284,16 +321,12 @@ def run_baseline_rag(
                 "hits_at_k": hits_val,
                 "recall_at_k": recall_val,
                 "precision_at_k": precision_val,
-                "prompt_len": llm_out.get("prompt_len", 0),
-                "output_tokens": llm_out.get("output_tokens", 0),
-                "total_tokens": llm_out.get("total_tokens", 0),
                 "reader_prompt_tokens": llm_out.get("prompt_len", 0),
                 "reader_output_tokens": llm_out.get("output_tokens", 0),
                 "reader_total_tokens": llm_out.get(
                     "total_tokens",
                     llm_out.get("prompt_len", 0) + llm_out.get("output_tokens", 0),
                 ),
-                "t_reader_ms": elapsed_ms,
                 "reader_wall_time_sec": round(elapsed_sec, 4),
                 "wall_time_sec": round(query_wall_sec, 4),
                 "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
@@ -320,7 +353,6 @@ def run_baseline_rag(
                 llm_out.get("prompt_len", 0) + llm_out.get("output_tokens", 0),
             ),
             "n_reader_calls": n_calls,
-            "t_reader_ms": elapsed_ms,
             "reader_wall_time_sec": round(elapsed_sec, 4),
             "wall_time_sec": round(query_wall_sec, 4),
             "query_latency_ms": elapsed_ms,
@@ -340,10 +372,8 @@ def run_baseline_rag(
     )
     reader_wall_time_sec_total = timing_stats["reader_wall_time_sec_total"]
     reader_wall_time_sec_mean = timing_stats["reader_wall_time_sec_mean"]
-    reader_wall_time_sec_median = timing_stats["reader_wall_time_sec_median"]
     wall_time_sec_total = sum(wall_times)
     wall_time_sec_mean = wall_time_sec_total / len(wall_times) if wall_times else 0.0
-    wall_time_sec_median = float(np.median(wall_times)) if wall_times else 0.0
     now_ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     metric_records = [
         {
@@ -418,11 +448,15 @@ def run_baseline_rag(
             "split": split,
             "variant": variant,
             "retriever": retriever,
-            "reader_model": reader_model,
             "passage_source": passage_source,
+            "sentence_mode": None,
+            "tau_low": None,
             "top_k": top_k,
+            "reader_model": reader_model,
+            "sentence_model": None,
             "n_chunks": len(passages),
             "queries_total": queries_total,
+            "seed": seed,
             "timestamp": now_ts,
         },
         "accuracy": {
@@ -432,20 +466,29 @@ def run_baseline_rag(
         "latency": {
             "wall_time_sec_total": round(wall_time_sec_total, 4),
             "wall_time_sec_mean": round(wall_time_sec_mean, 4),
-            "wall_time_sec_median": round(wall_time_sec_median, 4),
             "reader_wall_time_sec_total": round(reader_wall_time_sec_total, 4),
             "reader_wall_time_sec_mean": round(reader_wall_time_sec_mean, 4),
-            "reader_wall_time_sec_median": round(reader_wall_time_sec_median, 4),
         },
         "cost": {
-            "tokens_total": tokens_total,
-            "tokens_per_query_mean": round(tokens_per_query_mean, 4),
+            "overall_tokens_total": tokens_total,
+            "overall_tokens_per_query_mean": round(tokens_per_query_mean, 4),
+            "sentence_extractor_prompt_tokens_total": 0,
+            "sentence_extractor_output_tokens_total": 0,
+            "sentence_extractor_tokens_total": 0,
+            "sentence_extractor_calls_total": 0,
+            "sentence_extractor_prompt_tokens_per_query_mean": 0.0,
+            "sentence_extractor_tokens_per_query_mean": 0.0,
             "reader_prompt_tokens_total": token_totals.get("reader_prompt_tokens", 0),
             "reader_output_tokens_total": token_totals.get("reader_output_tokens", 0),
             "reader_tokens_total": token_totals.get("reader_total_tokens", 0),
             "reader_calls_total": token_totals.get("n_reader_calls", 0),
             "reader_prompt_tokens_per_query_mean": round(
                 token_totals.get("reader_prompt_tokens", 0) / queries_total, 4
+            )
+            if queries_total
+            else 0.0,
+            "reader_tokens_per_query_mean": round(
+                token_totals.get("reader_total_tokens", 0) / queries_total, 4
             )
             if queries_total
             else 0.0,
@@ -464,8 +507,6 @@ def run_baseline_rag(
     }
     if retrieval:
         summary["retrieval"] = retrieval
-    if seed is not None:
-        summary["meta"]["seed"] = seed
 
     print(
         f"[summary] overall throughput: {tokens_per_sec:.2f} tokens/s, "
@@ -491,11 +532,16 @@ def main() -> None:
                 if not os.path.exists(questions_path):
                     print(f"[skip] missing {dataset}/{split} questions: {questions_path}")
                     continue
-                for reader in READER_MODELS:
+                reader_models = (
+                    READER_MODEL
+                    if isinstance(READER_MODEL, (list, tuple))
+                    else [READER_MODEL]
+                )
+                for reader in reader_models:
                     for retriever, enabled in RETRIEVER_CONFIG.items():
                         if not enabled:
                             continue
-                        for top_k in TOP_K_SWEEP:
+                        for top_k in TOP_K_CHUNK_SWEEP:
                             print(
                                 f"[Baseline RAG] dataset={dataset} split={split} retriever={retriever} "
                                 f"reader={reader} top_k={top_k} seed={seed}"
@@ -507,9 +553,9 @@ def main() -> None:
                                 server_url=SERVER_URL,
                                 retriever=retriever,
                                 top_k=top_k,
-                                alpha=DEFAULT_HYBRID_ALPHA,
+                                alpha=HYBRID_ALPHA,
                                 seed=seed,
-                                resume=True,
+                                resume=RESUME,
                                 passage_source=PASSAGE_SOURCE,
                             )
                             print(metrics)

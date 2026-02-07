@@ -11,10 +11,12 @@ import spacy
 
 from src.utils.__utils__ import clean_text
 
+### SPACY
 SPACY_MODEL = os.environ.get("SPACY_MODEL", "en_core_web_sm")
 
 nlp = spacy.load(SPACY_MODEL, disable=["parser", "textcat"])
 
+### NORMALIZATION
 ALIAS = {
     # United States variants
     "u": "united_states",
@@ -87,6 +89,7 @@ def normalise_text(s: str) -> str:
     return t
 
 
+### ENTITY FILTERS
 # Keep only these named-entity types
 KEEP_ENTS = {
     "PERSON",

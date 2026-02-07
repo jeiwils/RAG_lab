@@ -11,6 +11,7 @@ from src.a3_representations.sparse_representations import (
     extract_keywords,
 )
 from src.a3_representations.representations_paths import dataset_rep_paths
+from src.a3_representations.representation_loading import load_chunk_representations
 
 __all__ = [
     "add_keywords_to_passages_jsonl",
@@ -20,4 +21,5 @@ __all__ = [
     "extract_keywords",
     "get_embedding_model",
     "load_faiss_index",
+    "load_chunk_representations",
 ]

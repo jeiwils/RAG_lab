@@ -24,11 +24,24 @@ __all__ = [
     "ask_llm_with_passages",
     "extract_final_answer",
     "post_process_answer",
+    "BASE_PROMPT_TEMPLATE",
+    "compute_max_context_tokens",
 ]
 
+### DEFAULTS
 DEFAULT_MAX_CONTEXT_TOKENS = int(os.environ.get("LLM_CONTEXT_WINDOW", "4096"))
 DEFAULT_CONTEXT_SAFETY_MARGIN = int(os.environ.get("LLM_CONTEXT_SAFETY_MARGIN", "128"))
 DEFAULT_MAX_PASSAGE_TOKENS = int(os.environ.get("MAX_PASSAGE_TOKENS", "512"))
+BASE_PROMPT_TEMPLATE = (
+    "Context information is below.\n"
+    "-----------------------\n"
+    "{context}\n"
+    "-----------------------\n"
+    "Given the context information and not prior knowledge, answer the query. "
+    "Do not provide any explanation.\n"
+    "Query: {query_text}\n"
+    "Answer:"
+)
 
 
 @lru_cache(maxsize=4)
@@ -49,6 +62,26 @@ def _estimate_tokens(text: str, model_name: str) -> int:
         return len(enc.encode(text))
     # Rough fallback: inflate word count to reduce risk of exceeding context.
     return int(len(text.split()) * 1.3) + 1
+
+
+def compute_max_context_tokens(
+    query_text: str,
+    model_name: str,
+    context_budget_tokens: int,
+    max_output_tokens: int,
+) -> int:
+    """Compute a max_context_tokens that yields the desired passage budget."""
+    if context_budget_tokens <= 0:
+        return 0
+    base_prompt = BASE_PROMPT_TEMPLATE.format(context="", query_text=query_text)
+    base_tokens = _estimate_tokens(base_prompt, model_name)
+    reserved_for_output = min(max_output_tokens, 256)
+    return (
+        context_budget_tokens
+        + base_tokens
+        + reserved_for_output
+        + DEFAULT_CONTEXT_SAFETY_MARGIN
+    )
 
 
 def _truncate_to_token_budget(text: str, budget: int, model_name: str) -> str:
@@ -149,15 +182,9 @@ def ask_llm_with_passages(
 
         passage_texts.append(passage)
 
-    base_prompt = (
-        "Context information is below.\n"
-        "-----------------------\n"
-        "{context}\n"
-        "-----------------------\n"
-        "Given the context information and not prior knowledge, answer the query. "
-        "Do not provide any explanation.\n"
-        f"Query: {query_text}\n"
-        "Answer:"
+    base_prompt = BASE_PROMPT_TEMPLATE.format(
+        context="{context}",
+        query_text=query_text,
     )
 
     context_window = max_context_tokens or DEFAULT_MAX_CONTEXT_TOKENS

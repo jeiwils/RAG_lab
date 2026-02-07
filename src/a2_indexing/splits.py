@@ -120,6 +120,10 @@ def carve_validation_split(
     ``data/processed_datasets/{dataset}/{train_split}/`` and
     ``data/processed_datasets/{dataset}/{val_split}/``.
     """
+    # Musique passage IDs embed the question ID before the first "_sent".
+    # Default "__" splitting would drop most passages from carved splits.
+    if dataset == "musique" and passage_id_split_token in (None, "__"):
+        passage_id_split_token = "_sent"
     src_paths = processed_dataset_paths(dataset, source_split)
     src_questions_path = src_paths["questions"]
     if not Path(src_questions_path).exists():
@@ -209,4 +213,3 @@ def carve_validation_split(
         "val_questions": str(len(val_ids)),
     }
     return results
-

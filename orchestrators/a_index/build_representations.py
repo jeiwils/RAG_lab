@@ -23,22 +23,30 @@ from src.utils.__utils__ import (
     processed_dataset_paths,
 )
 
-RESUME = True
+__all__ = ["main"]
 
+# ---------------------------------------------------------------------------
 # Config
-DATASETS = ["musique", "hotpotqa", "2wikimultihopqa", "natural_questions"]
-SPLITS = ["dev"] #["train_sub", "val", "dev"]
+# ---------------------------------------------------------------------------
 
+### DATA & SPLITS
+DATASETS = [
+    "musique",
+    #"hotpotqa",
+    #"2wikimultihopqa",
+    #"natural_questions",
+]
+SPLITS = ["val", "dev"] #["train_sub", "val", "dev"]
 PASSAGE_SOURCES = ["passages", "full_passages_chunks"]
 
+### RUN CONTROL
+RESUME = True
 
 
 def main() -> None:
     print(f"[spaCy] Using: {SPACY_MODEL}")
 
     bge_model = get_embedding_model()
-
-
 
     # -------------------------------
     # Phase A: Passages (Dataset-only)

@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Sequence
+from typing import Any, Callable, Dict, Sequence
 from tqdm import tqdm
 
 import torch
@@ -15,6 +14,11 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from src.utils.dataset_utils import build_training_examples, load_dataset_split
 from src.utils.__utils__ import processed_dataset_paths
+from src.b2_reranking.useful_sentence_extractor_infer import (
+    DEFAULT_MAX_LEN,
+    LOCAL_FILES_ONLY,
+    encode_batch,
+)
 from src.utils.lora_helpers import (
     evaluate_and_choose_tau,
     find_attention_projection_modules,
@@ -25,76 +29,45 @@ from src.utils.lora_helpers import (
     seed_everything as _seed_everything,
     trainable_parameters as _trainable_parameters,
 )
-from src.utils.supervised_learning_utils import grid_search
-from src.tests.plot_confusion_matrix import plot_confusion
-
-
-
-
-
+### DATA & SPLITS
 # Script-level defaults when running this file directly.
-DEFAULT_DATASET = "hotpotqa"
+DEFAULT_DATASET = "musique"
 DEFAULT_TRAIN_SPLIT = "train_sub"
 DEFAULT_DEV_SPLIT = "val"
 
 # Toggle to train on discourse-aware passages (passages_discourse_aware.jsonl).
 USE_DISCOURSE_AWARE_PASSAGES = False
 
-
+### RUN CONTROL
 USE_STRATIFIED_BATCHING = False
 DEFAULT_SEED = 1
 RUN_GRID_SEARCH = False
 
-
-
-#### BASE MODEL SETTINGS
-
-DEFAULT_TEXT_TEMPLATE = (
-    "Query:\n"
-    "{query}\n"
-    "Full context:\n"
-    "{context}\n"
-    "Sentence:\n"
-    "{sentence}\n"
-    "Is this sentence useful in answering the\n"
-    "query? Answer only \"Yes\" or \"No\""
-)
-
+### BASE MODEL SETTINGS
+# DEFAULT_MAX_LEN is imported from useful_sentence_extractor_infer.
 DEFAULT_BASE_MODEL = "microsoft/deberta-v3-base"
 DEFAULT_OUTPUT_DIR = "data/models/useful_sentence_lora"
 DEFAULT_OUTPUT_DIR_DISCOURSE_AWARE = "data/models/useful_sentence_lora_discourse_aware"
-DEFAULT_MAX_LEN = 256
 DEFAULT_EVAL_BATCH_SIZE = 32
 DEFAULT_WD = 0.0
 DEFAULT_WARMUP = 200
 DEFAULT_MAX_GRAD_NORM = 1.0
 
-
-
 ### LORA SETTINGS
-
-
 DEFAULT_HARD_NEGATIVES = 8
 DEFAULT_RANDOM_NEGATIVES = 1
 DEFAULT_POS_WEIGHT = None
-LOCAL_FILES_ONLY = True
-
+# LOCAL_FILES_ONLY is imported from useful_sentence_extractor_infer.
 DEFAULT_LR = 2e-5
-
 DEFAULT_NUM_EPOCHS = 8
 
 DEFAULT_LORA_R = 8
 DEFAULT_LORA_ALPHA = 16
 DEFAULT_LORA_DROPOUT = 0.05
 
-DEFAULT_BATCH_SIZE = 16 
+DEFAULT_BATCH_SIZE = 16
 
-
-
-
-
-#### GRID SEARCH SETTINGS
-
+### GRID SEARCH SETTINGS
 
 BEST_GRID_RUN_KWARGS = {
     "hard_negatives": 8,
@@ -151,130 +124,23 @@ GRID_CONFIGS = [
     },
 ]
 
-
-
-
-
 __all__ = [
     "DEFAULT_BASE_MODEL",
     "DEFAULT_OUTPUT_DIR",
-    "DEFAULT_TEXT_TEMPLATE",
     "build_training_examples",
-    "count_tokens",
     "encode_batch",
     "evaluate_and_choose_tau",
     "find_attention_projection_modules",
     "init_model_with_lora",
     "load_dataset_split",
-    "select_ranked_sentences",
     "train",
 ]
 
 
 
-
-
-
-
-_TOKEN_RE = re.compile(r"\S+")
-
-
-
-########
-
-
 def _split_exists(dataset: str, split: str) -> bool:
     paths = processed_dataset_paths(dataset, split)
     return Path(paths["questions"]).exists() and Path(paths["passages"]).exists()
-
-
-
-
-
-def encode_batch(
-    tokenizer,
-    batch: Sequence[Dict[str, Any]],
-    *,
-    max_length: int = DEFAULT_MAX_LEN,
-    text_template: str = DEFAULT_TEXT_TEMPLATE,
-):
-    """Tokenize a batch of question + sentence pairs."""
-    texts: List[str] = []
-    labels: List[int] = []
-    for ex in batch:
-        sentence = str(ex.get("sentence", ""))
-        context = str(ex.get("context", sentence))
-        texts.append(
-            text_template.format(
-                query=str(ex.get("query", "")),
-                context=context,
-                sentence=sentence,
-            )
-        )
-        labels.append(int(ex.get("label", 0)))
-
-    tokens = tokenizer(
-        texts,
-        padding="longest",
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
-    return tokens, torch.tensor(labels, dtype=torch.float32)
-
-
-def count_tokens(text: str) -> int:
-    """Approximate token count using whitespace-delimited tokens."""
-    if not text:
-        return 0
-    return len(_TOKEN_RE.findall(text))
-
-
-
-def select_ranked_sentences(
-    ranked: Sequence[Dict[str, Any]],
-    *,
-    token_budget: int | None,
-    tau_low: float | None = None,
-    count_tokens_fn: Callable[[str], int] | None = None,
-) -> List[Dict[str, Any]]:
-    """Select ranked items under an optional token budget with a low-score guardrail."""
-    enforce_budget = token_budget is not None
-    if enforce_budget and token_budget <= 0:
-        return []
-
-    if count_tokens_fn is None:
-        count_tokens_fn = count_tokens
-
-    selected: List[Dict[str, Any]] = []
-    total_tokens = 0
-
-    for item in ranked:
-        text = item.get("text")
-        if text is None:
-            text = item.get("sentence", "")
-        sent_tokens = count_tokens_fn(str(text)) if enforce_budget else 0
-
-        if enforce_budget and sent_tokens > token_budget:
-            continue
-
-        raw_score = item.get("score")
-        if raw_score is None:
-            raw_score = item.get("score_normalized", 0.0)
-        score = float(raw_score)
-        if tau_low is not None and score < tau_low:
-            continue
-
-        if enforce_budget and total_tokens + sent_tokens > token_budget:
-            continue
-
-        selected.append(item)
-        if enforce_budget:
-            total_tokens += sent_tokens
-            if total_tokens >= token_budget:
-                break
-
-    return selected
 
 
 def _run_explicit_grid(
@@ -327,11 +193,6 @@ def _run_explicit_grid(
         f"tau={best['tau']:.3f} dir={best.get('run_dir')}"
     )
     return best
-
-
-
-
-
 
 def train(
     *,
@@ -588,6 +449,8 @@ def train(
     with open(best_path, "wt", encoding="utf-8") as f:
         json.dump(best_metrics, f, indent=2)
     try:
+        from src.tests.plot_confusion_matrix import plot_confusion
+
         plot_confusion(best_path, None)
     except ModuleNotFoundError as exc:
         if str(exc).startswith("No module named 'matplotlib'"):
@@ -599,7 +462,6 @@ def train(
         f"dev_f1={best_metrics['dev_f1']:.4f} tau={best_metrics['tau']:.3f}"
     )
     return best_metrics
-
 
 if __name__ == "__main__":
     output_dir = (

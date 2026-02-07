@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+### MAX TOKENS
 MAX_TOKENS = {
     "cs": 200,
     "iqoq_generation": 192,
@@ -9,6 +10,7 @@ MAX_TOKENS = {
     "answer_generation": 512,
 }
 
+### TEMPERATURE
 TEMPERATURE = {
     "cs": 0.0,
     "iqoq_generation": 0.6,
@@ -16,6 +18,7 @@ TEMPERATURE = {
     "answer_generation": 0.6,
 }
 
+### LLM DEFAULTS
 LLM_DEFAULTS = {
     "top_p": 0.95,
     "top_k": 0,

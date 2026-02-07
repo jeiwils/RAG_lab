@@ -16,6 +16,7 @@ from src.b1_retrieval.sparse_retrieval import (
 
 logger = logging.getLogger(__name__)
 
+### DEFAULTS
 # Default weighting for combining dense cosine and sparse BM25 similarity.
 DEFAULT_HYBRID_ALPHA = 0.5
 

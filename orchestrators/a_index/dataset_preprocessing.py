@@ -37,27 +37,26 @@ from src.utils.__utils__ import (
     processed_dataset_paths,
 )
 
+# ---------------------------------------------------------------------------
 # Config
+# ---------------------------------------------------------------------------
+
+### DATA & SPLITS
 DATASETS_TO_PREPROCESS = [
-    #"musique",
-    "hotpotqa",
+    "musique",
+    #"hotpotqa",
     #"2wikimultihopqa",
     #"natural_questions",
     #"acord",
     #"fever",
 ]
-
-
-
-# change to train, hotpotqa, 25000
-
-RESUME = True
 SPLITS = ["train"] # ["dev"] #["train", "dev"]
 MAX_ROWS = 25000  # set to an int to cap rows per split
 
+### OUTPUTS
+TO_PREPROCESS = ["passages", "questions", "full_passages", "full_passages_chunks"]
 
-TO_PREPROCESS = ['passages', 'questions', 'full_passages', 'full_passages_chunks']
-
+### ACORD SETTINGS
 ACORD_POS_THRESHOLD = 3
 ACORD_NEG_THRESHOLD = 1
 ACORD_HARD_THRESHOLD = 2
@@ -68,7 +67,10 @@ ACORD_MAX_NEG = None
 ACORD_MAX_HARD_NEG = None
 ACORD_DROP_NO_POSITIVES = True
 
-# Validation split carving (from processed train split).
+### RUN CONTROL
+RESUME = True
+
+### VALIDATION SPLIT
 CARVE_VAL_SPLIT = True
 VAL_SOURCE_SPLIT = "train"
 VAL_TRAIN_SPLIT = "train_sub"

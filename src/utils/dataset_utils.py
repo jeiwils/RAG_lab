@@ -92,6 +92,9 @@ def load_dataset_split(
     passage_id_split_token: str | None = "__",
 ) -> List[Dict[str, Any]]:
     """Load processed dataset questions/passages and attach passages per question."""
+    # Musique passage IDs use "_sent" to separate question IDs from paragraph IDs.
+    if dataset == "musique" and passage_id_split_token in (None, "__"):
+        passage_id_split_token = "_sent"
     if questions_path is None or passages_path is None:
         paths = processed_dataset_paths(dataset, split)
         if questions_path is None:

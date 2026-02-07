@@ -43,9 +43,6 @@ def load_summary_metrics(
             obj = json.load(f)
         row = dict(obj)
         _flatten_schema(row)
-        _merge_eval_sections(row)
-        _normalize_summary_fields(row)
-        _ensure_queries_total(row)
         if "dataset" not in row:
             row["dataset"] = _infer_dataset(path)
         if "split" not in row:
@@ -60,8 +57,6 @@ def load_summary_metrics(
                     row[key] = value
         if "approach" not in row:
             row["approach"] = assign_approach(row)
-
-        _derive_tokens_per_query_mean(row)
 
         rows.append(row)
     return rows
@@ -141,80 +136,6 @@ def _flatten_schema(row: Dict[str, Any]) -> None:
             row.update(data)
 
 
-def _merge_eval_sections(row: Dict[str, Any]) -> None:
-    eval_sections = {
-        key: val
-        for key, val in row.items()
-        if key.endswith("_eval") and isinstance(val, dict)
-    }
-    if not eval_sections:
-        return
-    retriever = row.get("retriever")
-    if retriever:
-        preferred = eval_sections.get(f"{retriever}_eval")
-        if preferred:
-            row.update(preferred)
-            return
-    if len(eval_sections) == 1:
-        row.update(next(iter(eval_sections.values())))
-
-
-def _normalize_summary_fields(row: Dict[str, Any]) -> None:
-    if "mean_em" not in row:
-        if "EM" in row:
-            row["mean_em"] = row["EM"]
-        elif "em" in row:
-            row["mean_em"] = row["em"]
-    if "mean_f1" not in row:
-        if "F1" in row:
-            row["mean_f1"] = row["F1"]
-        elif "f1" in row:
-            row["mean_f1"] = row["f1"]
-
-    if "wall_time_sec_mean" not in row:
-        if "wall_time_mean_sec" in row:
-            row["wall_time_sec_mean"] = row["wall_time_mean_sec"]
-        elif "reader_wall_time_sec_mean" in row:
-            row["wall_time_sec_mean"] = row["reader_wall_time_sec_mean"]
-        elif "reader_wall_time_mean_sec" in row:
-            row["wall_time_sec_mean"] = row["reader_wall_time_mean_sec"]
-
-    if "wall_time_sec_median" not in row:
-        if "wall_time_median_sec" in row:
-            row["wall_time_sec_median"] = row["wall_time_median_sec"]
-        elif "reader_wall_time_sec_median" in row:
-            row["wall_time_sec_median"] = row["reader_wall_time_sec_median"]
-
-    if "wall_time_sec_total" not in row:
-        if "wall_time_total_sec" in row:
-            row["wall_time_sec_total"] = row["wall_time_total_sec"]
-        elif "reader_wall_time_total_sec" in row:
-            row["wall_time_sec_total"] = row["reader_wall_time_total_sec"]
-
-
-def _ensure_queries_total(row: Dict[str, Any]) -> None:
-    if row.get("queries_total"):
-        return
-    for key in ("num_queries", "n_queries", "n_reader_calls"):
-        val = row.get(key)
-        if val:
-            row["queries_total"] = val
-            return
-
-
-def _derive_tokens_per_query_mean(row: Dict[str, Any]) -> None:
-    if "tokens_per_query_mean" in row:
-        return
-    tokens_total = row.get("tokens_total")
-    if tokens_total is None:
-        return
-    queries_total = row.get("queries_total")
-    if not queries_total:
-        return
-    try:
-        row["tokens_per_query_mean"] = float(tokens_total) / float(queries_total)
-    except (TypeError, ValueError, ZeroDivisionError):
-        return
 
 
 def _infer_dataset(path: Path) -> str | None:

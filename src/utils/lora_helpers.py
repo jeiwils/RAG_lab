@@ -130,7 +130,13 @@ def make_minibatches(
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     items = list(examples)
-    if not shuffle or not stratified:
+    if not shuffle:
+        for idx in range(0, len(items), batch_size):
+            yield items[idx : idx + batch_size]
+        return
+    if not stratified:
+        rng = random.Random(seed)
+        rng.shuffle(items)
         for idx in range(0, len(items), batch_size):
             yield items[idx : idx + batch_size]
         return

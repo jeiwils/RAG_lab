@@ -35,6 +35,7 @@ from src.utils.__utils__ import (
     pid_plus_title,
     pid_plus_title_full,
     processed_dataset_paths,
+    raw_dataset_dir,
 )
 
 # ---------------------------------------------------------------------------
@@ -50,7 +51,7 @@ DATASETS_TO_PREPROCESS = [
     #"acord",
     #"fever",
 ]
-SPLITS = ["train"] # ["dev"] #["train", "dev"]
+SPLITS = ["train", "dev"] # ["dev"] #["train", "dev"]
 MAX_ROWS = 25000  # set to an int to cap rows per split
 
 ### OUTPUTS
@@ -577,7 +578,7 @@ def main() -> None:
                 continue
 
             if dataset == "acord":
-                raw_dir = Path("data/raw_datasets/ACORD")
+                raw_dir = raw_dataset_dir("ACORD")
                 split_alias = "valid" if split == "dev" else split
                 queries_path = raw_dir / "queries.jsonl"
                 corpus_path = raw_dir / "corpus.jsonl"

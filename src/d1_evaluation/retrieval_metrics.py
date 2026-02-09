@@ -1,10 +1,17 @@
-"""Retrieval metrics (hits@k, recall@k, precision@k)."""
+"""Retrieval metrics (hits@k, recall@k, precision@k, nDCG)."""
 
 from __future__ import annotations
 
+import math
 from typing import List
 
-__all__ = ["compute_recall_at_k", "compute_hits_at_k", "compute_precision_at_k"]
+__all__ = [
+    "compute_recall_at_k",
+    "compute_hits_at_k",
+    "compute_precision_at_k",
+    "compute_dcg",
+    "compute_ndcg",
+]
 
 
 def compute_recall_at_k(
@@ -92,3 +99,39 @@ def compute_precision_at_k(
     gold_set = set(gold_passages)
     hits = len(set(top_k) & gold_set)
     return hits / len(set(top_k))
+
+
+def compute_dcg(relevances: List[float], k: int | None = None) -> float:
+    """Compute Discounted Cumulative Gain (DCG).
+
+    Parameters
+    ----------
+    relevances:
+        Relevance scores ordered by predicted rank.
+    k:
+        Cutoff for evaluation; when ``None`` uses the full list.
+    """
+    if not relevances:
+        return 0.0
+    if k is None or k <= 0:
+        k = len(relevances)
+    dcg = 0.0
+    for idx, rel in enumerate(relevances[:k]):
+        gain = (2 ** float(rel)) - 1.0
+        denom = math.log2(idx + 2)
+        dcg += gain / denom
+    return dcg
+
+
+def compute_ndcg(relevances: List[float], k: int | None = None) -> float:
+    """Compute Normalized Discounted Cumulative Gain (nDCG)."""
+    if not relevances:
+        return 0.0
+    if k is None or k <= 0:
+        k = len(relevances)
+    dcg = compute_dcg(relevances, k=k)
+    ideal = sorted(relevances, reverse=True)
+    idcg = compute_dcg(ideal, k=k)
+    if idcg <= 0:
+        return 0.0
+    return dcg / idcg

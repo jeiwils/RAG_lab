@@ -366,6 +366,29 @@ def get_result_paths(model, dataset, split, variant):
         "summary": base / f"summary_metrics_{variant}_{split}.json",
     }
 
+def normalize_dataset_name(dataset: str) -> str:
+    """Return a normalized dataset name used for on-disk paths."""
+    return str(dataset).strip().lower()
+
+def raw_dataset_dir(dataset: str) -> Path:
+    """Return raw dataset directory, preferring case-insensitive matches."""
+    base = Path("data/raw_datasets")
+    candidate = base / dataset
+    if candidate.exists():
+        return candidate
+    if base.exists():
+        target = normalize_dataset_name(dataset)
+        for child in base.iterdir():
+            if child.is_dir() and child.name.lower() == target:
+                return child
+    return base / normalize_dataset_name(dataset)
+
+def processed_dataset_root(dataset: str) -> Path:
+    """Return the root directory for processed dataset artifacts."""
+    base = Path(f"data/processed_datasets/{normalize_dataset_name(dataset)}")
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
 def processed_dataset_paths(dataset: str, split: str) -> Dict[str, Path]:
     """Return standard paths for processed dataset files.
 
@@ -384,7 +407,7 @@ def processed_dataset_paths(dataset: str, split: str) -> Dict[str, Path]:
     ``full_passages_chunks_discourse_aware_debug`` stores only discourse-aware
     chunks that differ from standard chunking.
     """
-    base = Path(f"data/processed_datasets/{dataset}/{split}")
+    base = Path(f"data/processed_datasets/{normalize_dataset_name(dataset)}/{split}")
     base.mkdir(parents=True, exist_ok=True)
     return {
         "base": base,
@@ -680,6 +703,9 @@ __all__ = [
     "FOLDERS_BY_VARIANT",
     "resolve_root",
     "get_result_paths",
+    "normalize_dataset_name",
+    "raw_dataset_dir",
+    "processed_dataset_root",
     "processed_dataset_paths",
     "model_size",
     "split_jsonl",

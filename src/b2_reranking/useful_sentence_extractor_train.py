@@ -29,19 +29,14 @@ from src.utils.lora_helpers import (
     seed_everything as _seed_everything,
     trainable_parameters as _trainable_parameters,
 )
+
 ### DATA & SPLITS
-# Script-level defaults when running this file directly.
 DEFAULT_DATASET = "musique"
 DEFAULT_TRAIN_SPLIT = "train_sub"
 DEFAULT_DEV_SPLIT = "val"
 
 # Toggle to train on discourse-aware passages (passages_discourse_aware.jsonl).
 USE_DISCOURSE_AWARE_PASSAGES = False
-
-### RUN CONTROL
-USE_STRATIFIED_BATCHING = False
-DEFAULT_SEED = 1
-RUN_GRID_SEARCH = False
 
 ### BASE MODEL SETTINGS
 # DEFAULT_MAX_LEN is imported from useful_sentence_extractor_infer.
@@ -53,21 +48,9 @@ DEFAULT_WD = 0.0
 DEFAULT_WARMUP = 200
 DEFAULT_MAX_GRAD_NORM = 1.0
 
-### LORA SETTINGS
-DEFAULT_HARD_NEGATIVES = 8
-DEFAULT_RANDOM_NEGATIVES = 1
-DEFAULT_POS_WEIGHT = None
-# LOCAL_FILES_ONLY is imported from useful_sentence_extractor_infer.
-DEFAULT_LR = 2e-5
-DEFAULT_NUM_EPOCHS = 8
+### LORA/GRID SEARCH SETTINGS
 
-DEFAULT_LORA_R = 8
-DEFAULT_LORA_ALPHA = 16
-DEFAULT_LORA_DROPOUT = 0.05
-
-DEFAULT_BATCH_SIZE = 16
-
-### GRID SEARCH SETTINGS
+RUN_GRID_SEARCH = True
 
 BEST_GRID_RUN_KWARGS = {
     "hard_negatives": 8,
@@ -84,38 +67,25 @@ BEST_GRID_RUN_KWARGS = {
 
 GRID_CONFIGS = [
     {
-        "name": "transfer_balanced",
-        "hard_negatives": 6,
-        "random_negatives": 2,
-        "pos_weight": 1.0,
-        "lr": 2e-5,
-        "num_epochs": 2,
-        "lora_r": 8,
-        "lora_alpha": 16,
-        "lora_dropout": 0.05,
-        "batch_size": 16,
-        "weight_decay": 0.05,
-    },
-    {
-        "name": "transfer_precision",
-        "hard_negatives": 6,
-        "random_negatives": 2,
-        "pos_weight": 0.5,
-        "lr": 2e-5,
-        "num_epochs": 2,
-        "lora_r": 8,
-        "lora_alpha": 16,
-        "lora_dropout": 0.05,
-        "batch_size": 16,
-        "weight_decay": 0.05,
-    },
-    {
-        "name": "transfer_underfit",
+        "name": "musique_lr2e5_ep3",
         "hard_negatives": 8,
         "random_negatives": 2,
-        "pos_weight": 1.0,
+        "pos_weight": None,
+        "lr": 2e-5,
+        "num_epochs": 3,
+        "lora_r": 16,
+        "lora_alpha": 16,
+        "lora_dropout": 0.05,
+        "batch_size": 16,
+        "weight_decay": 0.01,
+    },
+    {
+        "name": "musique_lr3e5_ep3",
+        "hard_negatives": 8,
+        "random_negatives": 2,
+        "pos_weight": None,
         "lr": 3e-5,
-        "num_epochs": 2,
+        "num_epochs": 3,
         "lora_r": 16,
         "lora_alpha": 16,
         "lora_dropout": 0.05,
@@ -123,6 +93,9 @@ GRID_CONFIGS = [
         "weight_decay": 0.01,
     },
 ]
+
+DEFAULT_SEED = 1
+
 
 __all__ = [
     "DEFAULT_BASE_MODEL",
@@ -215,17 +188,17 @@ def train(
     passage_id_split_token: str | None = "__",
     max_train_records: int | None = None,
     max_dev_records: int | None = None,
-    hard_negatives: int = DEFAULT_HARD_NEGATIVES,
-    random_negatives: int = DEFAULT_RANDOM_NEGATIVES,
-    pos_weight: float | None = DEFAULT_POS_WEIGHT,
-    batch_size: int = DEFAULT_BATCH_SIZE,
+    hard_negatives: int | None = None,
+    random_negatives: int | None = None,
+    pos_weight: float | None = None,
+    batch_size: int | None = None,
     eval_batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
     max_length: int = DEFAULT_MAX_LEN,
-    num_epochs: int = DEFAULT_NUM_EPOCHS,
-    lr: float = DEFAULT_LR,
-    lora_r: int = DEFAULT_LORA_R,
-    lora_alpha: int = DEFAULT_LORA_ALPHA,
-    lora_dropout: float = DEFAULT_LORA_DROPOUT,
+    num_epochs: int | None = None,
+    lr: float | None = None,
+    lora_r: int | None = None,
+    lora_alpha: int | None = None,
+    lora_dropout: float | None = None,
     weight_decay: float = DEFAULT_WD,
     warmup_steps: int = DEFAULT_WARMUP,
     max_grad_norm: float = DEFAULT_MAX_GRAD_NORM,
@@ -242,6 +215,24 @@ def train(
 
     if seed is not None:
         _seed_everything(seed)
+
+    # Local defaults (can be overridden via BEST_GRID_RUN_KWARGS / GRID_CONFIGS).
+    if hard_negatives is None:
+        hard_negatives = 8
+    if random_negatives is None:
+        random_negatives = 1
+    if batch_size is None:
+        batch_size = 16
+    if num_epochs is None:
+        num_epochs = 8
+    if lr is None:
+        lr = 2e-5
+    if lora_r is None:
+        lora_r = 8
+    if lora_alpha is None:
+        lora_alpha = 16
+    if lora_dropout is None:
+        lora_dropout = 0.05
 
     if not _split_exists(dataset, train_split):
         raise FileNotFoundError(
@@ -358,9 +349,8 @@ def train(
             make_minibatches(
                 train_examples,
                 batch_size=batch_size,
-                shuffle=True,
+                shuffle=False,
                 seed=seed,
-                stratified=USE_STRATIFIED_BATCHING,
             ),
             total=steps_per_epoch or None,
             desc=f"epoch {epoch}",

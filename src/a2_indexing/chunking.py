@@ -1,13 +1,13 @@
 """Chunking utilities for splitting text into fixed-length segments."""
 
 from __future__ import annotations
-
+import pysbd
 from dataclasses import dataclass
 import os
 from pathlib import Path
 import re
 from typing import Dict, Iterable, Iterator, List, Sequence, Tuple, TYPE_CHECKING
-
+import json
 from src.a2_indexing.chunking_paths import _chunk_paths
 from src.utils.__utils__ import append_jsonl, existing_ids, load_jsonl, processed_dataset_paths
 
@@ -153,21 +153,31 @@ def _trim_span(text: str, start: int, end: int, strip_whitespace: bool) -> Tuple
     return start, end, text[start:end]
 
 
+_SBD_SEGMENTER = pysbd.Segmenter(language="en", clean=False)
+
 def _iter_spans(text: str, split_on: str) -> Iterator[Tuple[int, int]]:
     mode = _normalise_split_on(split_on)
+    
+    # Sentence splitting using pysbd; follow with CLI-style character offsets.
+    if mode == "sentence":
+        start = 0
+        for sentence in _SBD_SEGMENTER.segment(text):
+            try:
+                idx = text.index(sentence, start)
+            except ValueError:
+                idx = start
+            end = idx + len(sentence)
+            if idx < end:
+                yield idx, end
+            start = end
+        if start < len(text):
+            yield start, len(text)
+        return
+
+    # Keep your existing logic for other modes
     if mode == "token":
         for m in _TOKEN_RE.finditer(text):
             yield m.start(), m.end()
-        return
-    if mode == "sentence":
-        start = 0
-        for m in _SENTENCE_BOUNDARY_RE.finditer(text):
-            end = m.start()
-            if start < end:
-                yield start, end
-            start = m.end()
-        if start < len(text):
-            yield start, len(text)
         return
     if mode == "paragraph":
         start = 0
@@ -422,6 +432,151 @@ def chunk_record(
     return output
 
 
+def _chunk_record_generic(
+    record: Dict,
+    config,
+    chunk_text_fn,
+    *,
+    text_field: str = "text",
+    id_field: str = "passage_id",
+    title_field: str | None = "title",
+    output_id_field: str = "chunk_id",
+    parent_id_field: str = "source_id",
+    copy_fields: Sequence[str] = (),
+) -> List[Dict]:
+    """Chunk a single record into chunk dictionaries using chunk_text_fn."""
+    if text_field not in record:
+        raise KeyError(f"Missing {text_field} in record.")
+    if id_field not in record:
+        raise KeyError(f"Missing {id_field} in record.")
+
+    text = record[text_field]
+    source_id = record[id_field]
+    chunks = chunk_text_fn(text, config)
+
+    output: List[Dict] = []
+    for chunk in chunks:
+        chunk_id = make_chunk_id(str(source_id), chunk.index)
+        item = {
+            output_id_field: chunk_id,
+            parent_id_field: source_id,
+            "chunk_index": chunk.index,
+            "text": chunk.text,
+            "char_start": chunk.start,
+            "char_end": chunk.end,
+        }
+        if title_field and title_field in record:
+            item[title_field] = record[title_field]
+        for field in copy_fields:
+            if field in record:
+                item[field] = record[field]
+        output.append(item)
+    return output
+
+
+def _chunk_records_generic(
+    records: Iterable[Dict],
+    config,
+    chunk_text_fn,
+    *,
+    text_field: str = "text",
+    id_field: str = "passage_id",
+    title_field: str | None = "title",
+    output_id_field: str = "chunk_id",
+    parent_id_field: str = "source_id",
+    copy_fields: Sequence[str] = (),
+) -> Iterator[Dict]:
+    """Yield chunk dictionaries for an iterable of records."""
+    for record in records:
+        for chunk in _chunk_record_generic(
+            record,
+            config,
+            chunk_text_fn,
+            text_field=text_field,
+            id_field=id_field,
+            title_field=title_field,
+            output_id_field=output_id_field,
+            parent_id_field=parent_id_field,
+            copy_fields=copy_fields,
+        ):
+            yield chunk
+
+
+def _chunk_jsonl_generic(
+    input_path: str,
+    output_path: str,
+    config,
+    chunk_text_fn,
+    *,
+    text_field: str = "text",
+    id_field: str = "passage_id",
+    title_field: str | None = "title",
+    output_id_field: str = "chunk_id",
+    parent_id_field: str = "source_id",
+    copy_fields: Sequence[str] = (),
+    resume: bool = False,
+    overwrite: bool = False,
+) -> str:
+    """Chunk a JSONL file and write chunked records to ``output_path``."""
+    out_path = Path(output_path)
+
+    if out_path.exists():
+        if overwrite:
+            out_path.unlink()
+        elif not resume:
+            raise FileExistsError(f"{out_path} exists. Use overwrite=True or resume=True.")
+
+    done_sources = set()
+    if resume and out_path.exists():
+        done_sources = existing_ids(str(out_path), id_field=parent_id_field)
+
+    with out_path.open("a", encoding="utf-8", buffering=1) as f:
+        for record in load_jsonl(input_path):
+            source_id = record.get(id_field)
+            if resume and source_id in done_sources:
+                continue
+            chunks = _chunk_record_generic(
+                record,
+                config,
+                chunk_text_fn,
+                text_field=text_field,
+                id_field=id_field,
+                title_field=title_field,
+                output_id_field=output_id_field,
+                parent_id_field=parent_id_field,
+                copy_fields=copy_fields,
+            )
+            for chunk in chunks:
+                f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+
+    return str(out_path)
+
+
+def chunk_record(
+    record: Dict,
+    config: ChunkingConfig,
+    *,
+    text_field: str = "text",
+    id_field: str = "passage_id",
+    title_field: str | None = "title",
+    output_id_field: str = "chunk_id",
+    parent_id_field: str = "source_id",
+    copy_fields: Sequence[str] = (),
+) -> List[Dict]:
+    """Chunk a single record into chunk dictionaries."""
+    return _chunk_record_generic(
+        record,
+        config,
+        chunk_text,
+        text_field=text_field,
+        id_field=id_field,
+        title_field=title_field,
+        output_id_field=output_id_field,
+        parent_id_field=parent_id_field,
+        copy_fields=copy_fields,
+    )
+
+
 def chunk_records(
     records: Iterable[Dict],
     config: ChunkingConfig,
@@ -434,19 +589,17 @@ def chunk_records(
     copy_fields: Sequence[str] = (),
 ) -> Iterator[Dict]:
     """Yield chunk dictionaries for an iterable of records."""
-
-    for record in records:
-        for chunk in chunk_record(
-            record,
-            config,
-            text_field=text_field,
-            id_field=id_field,
-            title_field=title_field,
-            output_id_field=output_id_field,
-            parent_id_field=parent_id_field,
-            copy_fields=copy_fields,
-        ):
-            yield chunk
+    return _chunk_records_generic(
+        records,
+        config,
+        chunk_text,
+        text_field=text_field,
+        id_field=id_field,
+        title_field=title_field,
+        output_id_field=output_id_field,
+        parent_id_field=parent_id_field,
+        copy_fields=copy_fields,
+    )
 
 
 def chunk_jsonl(
@@ -463,37 +616,43 @@ def chunk_jsonl(
     resume: bool = False,
     overwrite: bool = False,
 ) -> str:
-    """Chunk a JSONL file and write chunked records to ``output_path``."""
-
-    if os.path.exists(output_path):
+    """Chunk a JSONL file with optimized buffered I/O."""
+    out_path = Path(output_path)
+    
+    if out_path.exists():
         if overwrite:
-            os.remove(output_path)
+            out_path.unlink()
         elif not resume:
-            raise FileExistsError(
-                f"{output_path} exists. Use overwrite=True or resume=True."
-            )
+            raise FileExistsError(f"{out_path} exists. Use overwrite=True or resume=True.")
 
     done_sources = set()
-    if resume and os.path.exists(output_path):
-        done_sources = existing_ids(output_path, id_field=parent_id_field)
+    if resume and out_path.exists():
+        done_sources = existing_ids(str(out_path), id_field=parent_id_field)
 
-    for record in load_jsonl(input_path):
-        source_id = record.get(id_field)
-        if resume and source_id in done_sources:
-            continue
-        for chunk in chunk_record(
-            record,
-            config,
-            text_field=text_field,
-            id_field=id_field,
-            title_field=title_field,
-            output_id_field=output_id_field,
-            parent_id_field=parent_id_field,
-            copy_fields=copy_fields,
-        ):
-            append_jsonl(output_path, chunk)
+    # Open the file ONCE in append mode
+    with out_path.open("a", encoding="utf-8", buffering=1) as f:
+        for record in load_jsonl(input_path):
+            source_id = record.get(id_field)
+            if resume and source_id in done_sources:
+                continue
+            
+            # Get all chunks for this record
+            chunks = chunk_record(
+                record,
+                config,
+                text_field=text_field,
+                id_field=id_field,
+                title_field=title_field,
+                output_id_field=output_id_field,
+                parent_id_field=parent_id_field,
+                copy_fields=copy_fields,
+            )
+            
+            # Write them in one go to the buffer
+            for chunk in chunks:
+                f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
 
-    return output_path
+    return str(out_path)
 
 
 def _ensure_chunked_passages(

@@ -50,7 +50,7 @@ import random
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple
 
-from src.a1_ingestion.chunking import (
+from src.a2_indexing.chunking import (
     split_long_passage,
     split_long_passage_discourse_aware,
     split_long_passage_discourse_aware_with_flags,

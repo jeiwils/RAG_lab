@@ -17,3 +17,4 @@ tiktoken
 protobuf
 matplotlib
 pyyaml
+pysbd

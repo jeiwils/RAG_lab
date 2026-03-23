@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import List
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "compute_recall_at_k",
@@ -122,16 +125,23 @@ def compute_dcg(relevances: List[float], k: int | None = None) -> float:
         dcg += gain / denom
     return dcg
 
-
 def compute_ndcg(relevances: List[float], k: int | None = None) -> float:
     """Compute Normalized Discounted Cumulative Gain (nDCG)."""
     if not relevances:
+        logger.warning("Empty relevances list; returning 0.0")
         return 0.0
-    if k is None or k <= 0:
+
+    if k is not None and (k <= 0 or k > len(relevances)):
+        logger.warning(f"Invalid k: {k}; using {len(relevances)}")
         k = len(relevances)
+
     dcg = compute_dcg(relevances, k=k)
     ideal = sorted(relevances, reverse=True)
     idcg = compute_dcg(ideal, k=k)
+
     if idcg <= 0:
+        logger.warning("IDCG is 0; returning 0.0")
         return 0.0
+
     return dcg / idcg
+

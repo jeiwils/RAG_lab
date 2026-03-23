@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from functools import lru_cache
@@ -18,6 +19,8 @@ except Exception:  # pragma: no cover - fallback when tiktoken missing
 
 from src.d1_evaluation.answer_metrics import normalise_answer
 from src.utils.x_config import MAX_TOKENS, TEMPERATURE
+
+logger = logging.getLogger(__name__)
 from src.utils.z_llm_utils import is_r1_like, query_llm, strip_think
 
 __all__ = [
@@ -152,7 +155,6 @@ def post_process_answer(
 
     return text
 
-
 def ask_llm_with_passages(
     query_text: str,
     passage_ids: List[str],
@@ -170,16 +172,28 @@ def ask_llm_with_passages(
     local_files_only: bool = True,
 ) -> Dict[str, str]:
     """Generate an answer from top passages using an LLM server."""
-    passage_texts = []
+    if not query_text.strip() or not passage_ids:
+        logger.warning("Empty query or passage_ids; returning empty answer")
+        return {
+            "raw_answer": "",
+            "raw_clean": "",
+            "normalised_answer": "",
+            "prompt_len": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
 
+    passage_texts = []
     for i, pid in enumerate(passage_ids[:top_k_answer_passages], start=1):
+        passage = None
         if graph:
             passage = graph.nodes[pid].get("text", "")
         elif passage_lookup:
             passage = passage_lookup.get(pid, "")
-        else:
-            passage = "[missing passage]"
-
+        
+        if not passage or not passage.strip():
+            logger.warning(f"Skipping missing or empty passage {pid}")
+            continue
         passage_texts.append(passage)
 
     base_prompt = BASE_PROMPT_TEMPLATE.format(
@@ -229,38 +243,44 @@ def ask_llm_with_passages(
     if is_r1_like(model_name):
         stop_sequences = None
 
-    for _ in range(max_attempts):
-        if in_process:
-            raw, usage = _query_llm_in_process(
-                prompt,
-                model_name=model_name,
-                max_tokens=max_tokens,
-                temperature=TEMPERATURE.get("answer_generation", 0.0),
-                stop=stop_sequences,
-                seed=seed,
-                local_files_only=local_files_only,
-            )
-        else:
-            if not server_url:
-                raise ValueError("server_url must be set when in_process=False")
-            raw, usage = query_llm(
-                prompt,
-                server_url=server_url,
-                max_tokens=max_tokens,
-                model_name=model_name,
-                stop=stop_sequences,
-                temperature=TEMPERATURE.get("answer_generation", 0.0),
-                phase="answer_generation",
-                seed=seed,
-            )
+    for attempt in range(max_attempts):
+        try:
+            if in_process:
+                raw, usage = _query_llm_in_process(
+                    prompt,
+                    model_name=model_name,
+                    max_tokens=max_tokens,
+                    temperature=TEMPERATURE.get("answer_generation", 0.0),
+                    stop=stop_sequences,
+                    seed=seed,
+                    local_files_only=local_files_only,
+                )
+            else:
+                if not server_url:
+                    raise ValueError("server_url must be set when in_process=False")
+                raw, usage = query_llm(
+                    prompt,
+                    server_url=server_url,
+                    max_tokens=max_tokens,
+                    model_name=model_name,
+                    stop=stop_sequences,
+                    temperature=TEMPERATURE.get("answer_generation", 0.0),
+                    phase="answer_generation",
+                    seed=seed,
+                )
 
-        if is_r1_like(model_name):
-            raw = strip_think(raw)
+            if is_r1_like(model_name):
+                raw = strip_think(raw)
 
-        raw_clean = first_fragment(extract_final_answer(raw))
-        if post_process_answer(raw_clean) is not None:
-            break
+            raw_clean = first_fragment(extract_final_answer(raw))
+            if post_process_answer(raw_clean) is not None:
+                break
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1} failed: {e}")
+            if attempt == max_attempts - 1:
+                break
     else:
+        logger.warning("All attempts failed; returning 'unknown'")
         raw = raw_clean = "unknown"
 
     prompt_tokens = usage.get("prompt_tokens", 0)
@@ -277,6 +297,7 @@ def ask_llm_with_passages(
         "output_tokens": completion_tokens,
         "total_tokens": total_tokens,
     }
+
 
 
 @lru_cache(maxsize=1)

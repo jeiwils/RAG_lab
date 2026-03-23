@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import unicodedata
@@ -15,6 +16,7 @@ from src.utils.__utils__ import clean_text
 SPACY_MODEL = os.environ.get("SPACY_MODEL", "en_core_web_sm")
 
 nlp = spacy.load(SPACY_MODEL, disable=["parser", "textcat"])
+logger = logging.getLogger(__name__)
 
 ### NORMALIZATION
 ALIAS = {
@@ -118,19 +120,38 @@ def extract_keywords(text: str) -> list[str]:
                     out.add(canon)
     return sorted(out)
 
-
 def add_keywords_to_passages_jsonl(
     passages_jsonl: str,
-    only_ids: set[str] | None = None,
+    only_ids: Set[str] | None = None,
+    batch_size: int = 1000,
 ):
-    rows = [json.loads(l) for l in open(passages_jsonl, "rt", encoding="utf-8")]
+    """Add keywords to passages in a JSONL file.
+
+    Parameters
+    ----------
+    passages_jsonl: str
+        Path to the JSONL file containing passages.
+    only_ids: set[str], optional
+        Set of passage IDs to process. If None, all passages are processed.
+    batch_size: int, optional
+        Batch size for spaCy's nlp.pipe.
+    """
+    try:
+        with open(passages_jsonl, "rt", encoding="utf-8") as f:
+            rows = [json.loads(l) for l in f]
+    except Exception as e:
+        logger.error(f"Failed to read {passages_jsonl}: {e}")
+        raise
+
     if only_ids:
         targets = [r for r in rows if r.get("passage_id") in only_ids]
     else:
         targets = rows
-    texts = [r.get("text", "") for r in targets]
 
-    for r, doc in zip(targets, nlp.pipe(texts, batch_size=128, n_process=1)):
+    texts = [r.get("text", "") for r in targets]
+    docs = list(nlp.pipe(texts, batch_size=batch_size, n_process=1))
+
+    for r, doc in zip(targets, docs):
         kws = set()
         for ent in doc.ents:
             if ent.label_ in KEEP_ENTS and ent.text.strip():
@@ -140,6 +161,10 @@ def add_keywords_to_passages_jsonl(
                     kws.add(canon)
         r["keywords_passage"] = sorted(kws)
 
-    with open(passages_jsonl, "wt", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    try:
+        with open(passages_jsonl, "wt", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.error(f"Failed to write to {passages_jsonl}: {e}")
+        raise

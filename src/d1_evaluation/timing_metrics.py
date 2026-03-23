@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Callable, Dict, List, TypeVar
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "wall_time",
@@ -23,13 +26,23 @@ def wall_time(func: Callable[..., T], *args, **kwargs) -> tuple[T, float]:
     elapsed = time.perf_counter() - start
     return result, float(elapsed)
 
-
 def summarize_reader_wall_times(
     reader_wall_times: List[float],
     *,
     n_reader_calls: float = 0,
 ) -> Dict[str, float]:
     """Summarize reader wall times and derive latency stats."""
+    if not reader_wall_times:
+        logger.warning("Empty reader_wall_times list; returning zeros")
+        return {
+            "reader_wall_time_sec_total": 0.0,
+            "reader_wall_time_sec_mean": 0.0,
+            "reader_wall_time_sec_median": 0.0,
+            "reader_time_ms_total": 0.0,
+            "query_latency_ms": 0.0,
+            "call_latency_ms": 0.0,
+        }
+
     total_sec = sum(reader_wall_times)
     mean_sec = total_sec / len(reader_wall_times) if reader_wall_times else 0.0
     median_sec = float(np.median(reader_wall_times)) if reader_wall_times else 0.0
@@ -45,6 +58,7 @@ def summarize_reader_wall_times(
         "query_latency_ms": query_latency_ms,
         "call_latency_ms": call_latency_ms,
     }
+
 
 
 def compute_throughput_stats(

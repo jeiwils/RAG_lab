@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import string
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "normalise_answer",
@@ -55,19 +58,34 @@ def compute_f1(pred: str, gold: str) -> float:
     recall = num_same / len(gold_tokens)
     return 2 * precision * recall / (precision + recall)
 
-
 def evaluate_answers(
     predictions: dict[str, str],
     gold_answers: dict[str, list[str]],
 ) -> dict[str, dict]:
     """Compute per-query EM and F1 scores."""
+    if not predictions or not gold_answers:
+        logger.warning("Empty predictions or gold answers; returning empty results")
+        return {}
+
     results: dict[str, dict] = {}
     for qid, gold_list in gold_answers.items():
         pred = predictions.get(qid, "")
+        if not pred:
+            logger.debug(f"No prediction for query ID: {qid}")
+            results[qid] = {"prediction": "", "em": 0, "f1": 0.0}
+            continue
+
+        if not gold_list:
+            logger.warning(f"No gold answers for query ID: {qid}")
+            results[qid] = {"prediction": pred, "em": 0, "f1": 0.0}
+            continue
+
         em = max((compute_exact_match(pred, g) for g in gold_list), default=0)
         f1 = max((compute_f1(pred, g) for g in gold_list), default=0.0)
         results[qid] = {"prediction": pred, "em": em, "f1": f1}
+
     return results
+
 
 
 def aggregate_answer_scores(predictions: dict, gold_answers: dict) -> dict:

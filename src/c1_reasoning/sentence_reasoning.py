@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Sequence, Tuple
 
@@ -18,6 +19,8 @@ from src.d1_evaluation.retrieval_metrics import (
     compute_precision_at_k,
     compute_recall_at_k,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_SENTENCE_EVAL_PROMPT",
@@ -176,7 +179,6 @@ def _score_to_unit(score: int, scale: Tuple[int, int]) -> float:
         return 0.0
     return (score - min_score) / (max_score - min_score)
 
-
 def evaluate_sentence_usefulness(
     question: str,
     sentence: str,
@@ -189,13 +191,10 @@ def evaluate_sentence_usefulness(
     raise_on_invalid: bool = False,
     seed: int | None = None,
 ) -> Dict[str, object]:
-    """Score how useful a sentence is for answering a question.
-
-    Returns a dict with the raw model output, integer score, normalized score,
-    and token usage stats.
-    """
+    """Score how useful a sentence is for answering a question."""
     min_score, max_score = _validate_scale(scale)
     if not question.strip() or not sentence.strip():
+        logger.warning("Empty question or sentence; returning minimum score")
         return {
             "raw": "",
             "score": min_score,
@@ -217,42 +216,49 @@ def evaluate_sentence_usefulness(
 
     last_raw = ""
     last_usage: Dict[str, int] = {}
-    for _ in range(max_attempts):
-        raw, usage = query_llm(
-            prompt,
-            server_url=server_url,
-            max_tokens=MAX_TOKENS.get("cs", 128),  # TODO: add a dedicated setting
-            temperature=TEMPERATURE.get("cs", 0.0),
-            model_name=model_name,
-            phase="cs",
-            grammar=grammar,
-            reason=reason,
-            seed=seed,
-            **LLM_DEFAULTS,
-        )
-        if is_r1_like(model_name):
-            raw = strip_think(raw)
-        last_raw = raw
-        last_usage = usage
+    for attempt in range(max_attempts):
+        try:
+            raw, usage = query_llm(
+                prompt,
+                server_url=server_url,
+                max_tokens=MAX_TOKENS.get("cs", 128),
+                temperature=TEMPERATURE.get("cs", 0.0),
+                model_name=model_name,
+                phase="cs",
+                grammar=grammar,
+                reason=reason,
+                seed=seed,
+                **LLM_DEFAULTS,
+            )
+            if is_r1_like(model_name):
+                raw = strip_think(raw)
+            last_raw = raw
+            last_usage = usage
 
-        score, invalid = _extract_score(raw, scale)
-        if score is not None:
-            return {
-                "raw": raw,
-                "score": score,
-                "score_normalized": _score_to_unit(score, scale),
-                "invalid": invalid,
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "total_tokens": usage.get(
-                    "total_tokens",
-                    usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0),
-                ),
-            }
+            score, invalid = _extract_score(raw, scale)
+            if score is not None:
+                logger.debug(f"Successfully scored sentence (attempt {attempt + 1}): {score}")
+                return {
+                    "raw": raw,
+                    "score": score,
+                    "score_normalized": _score_to_unit(score, scale),
+                    "invalid": invalid,
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get(
+                        "total_tokens",
+                        usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0),
+                    ),
+                }
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1} failed: {e}")
+            if attempt == max_attempts - 1:
+                break
 
     if raise_on_invalid:
-        raise ValueError(f"Invalid usefulness score: {last_raw!r}")
+        raise ValueError(f"Invalid usefulness score after {max_attempts} attempts: {last_raw!r}")
 
+    logger.warning(f"Returning minimum score after {max_attempts} attempts")
     return {
         "raw": last_raw,
         "score": min_score,
@@ -265,6 +271,7 @@ def evaluate_sentence_usefulness(
             last_usage.get("prompt_tokens", 0) + last_usage.get("completion_tokens", 0),
         ),
     }
+
 
 
 def _score_sentences(

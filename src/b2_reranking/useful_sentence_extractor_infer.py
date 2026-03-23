@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -11,6 +12,8 @@ from typing import Any, Callable, Dict, List, Sequence
 import torch
 from peft import PeftModel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_TEXT_TEMPLATE",
@@ -166,7 +169,6 @@ def load_sentence_lora(checkpoint_dir: str, *, local_files_only: bool = True):
     model.eval()
     return model, tokenizer, device
 
-
 def score_sentences_lora(
     question: str,
     sentences: List[Dict[str, Any]],
@@ -177,18 +179,32 @@ def score_sentences_lora(
     local_files_only: bool = LOCAL_FILES_ONLY,
 ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Score sentence candidates with the LoRA classifier and return token stats."""
+    if not sentences:
+        logger.warning("No sentences provided; returning empty list")
+        return [], {
+            "sentence_prompt_tokens": 0,
+            "sentence_output_tokens": 0,
+            "sentence_total_tokens": 0,
+            "n_sentence_calls": 0,
+        }
+
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+
+    try:
+        model, tokenizer, device = load_sentence_lora(
+            str(checkpoint_dir), local_files_only=local_files_only
+        )
+    except Exception as e:
+        logger.error(f"Failed to load LoRA model: {e}")
+        raise
+
     totals = {
         "sentence_prompt_tokens": 0,
         "sentence_output_tokens": 0,
         "sentence_total_tokens": 0,
         "n_sentence_calls": 0,
     }
-    if not sentences:
-        return [], totals
-
-    model, tokenizer, device = load_sentence_lora(
-        str(checkpoint_dir), local_files_only=local_files_only
-    )
 
     scored: List[Dict[str, Any]] = []
     for start in range(0, len(sentences), batch_size):
@@ -202,7 +218,13 @@ def score_sentences_lora(
             }
             for item in batch_items
         ]
-        tokens, _ = encode_batch(tokenizer, batch, max_length=max_length)
+
+        try:
+            tokens, _ = encode_batch(tokenizer, batch, max_length=max_length)
+        except Exception as e:
+            logger.error(f"Failed to encode batch: {e}")
+            continue
+
         attention_mask = tokens.get("attention_mask")
         if attention_mask is not None:
             totals["sentence_prompt_tokens"] += int(attention_mask.sum().item())
@@ -211,8 +233,13 @@ def score_sentences_lora(
 
         tokens = {k: v.to(device) for k, v in tokens.items()}
         with torch.no_grad():
-            logits = model(**tokens).logits.squeeze(-1)
-            probs = torch.sigmoid(logits)
+            try:
+                logits = model(**tokens).logits.squeeze(-1)
+                probs = torch.sigmoid(logits)
+            except Exception as e:
+                logger.error(f"Failed to score batch: {e}")
+                continue
+
         if probs.dim() == 0:
             probs = probs.unsqueeze(0)
         prob_list = probs.detach().cpu().tolist()
@@ -232,3 +259,4 @@ def score_sentences_lora(
 
     totals["sentence_total_tokens"] = totals["sentence_prompt_tokens"]
     return scored, totals
+

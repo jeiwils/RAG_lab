@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+from pathlib import Path
 from typing import Set
 
 import faiss
@@ -15,6 +17,7 @@ from src.utils.__utils__ import load_jsonl
 
 _bge_model = None
 
+logger = logging.getLogger(__name__)
 
 """################## Embedding model + encoding ##################"""
 
@@ -33,14 +36,15 @@ def get_embedding_model():
     return _bge_model
 
 
+
 def embed_and_save(
-    input_jsonl,
-    output_npy,
-    output_jsonl,
-    model,
-    text_key,
+    input_jsonl: str,
+    output_npy: str,
+    output_jsonl: str,
+    model: SentenceTransformer,
+    text_key: str,
     *,
-    id_field="passage_id",
+    id_field: str = "passage_id",
     done_ids: Set[str] | None = None,
     output_jsonl_input: str | None = None,
 ):
@@ -66,6 +70,10 @@ def embed_and_save(
         Path to the JSONL file providing the metadata to write to ``output_jsonl``.
         If ``None``, ``input_jsonl`` is used.
     """
+
+    input_path = Path(input_jsonl)
+    output_npy_path = Path(output_npy)
+    output_jsonl_path = Path(output_jsonl)
 
     if not text_key:
         raise ValueError("You must provide a valid text_key (e.g., 'text' or 'question').")
@@ -104,16 +112,16 @@ def embed_and_save(
 
     existing_embs = None
     vec_offset = 0
-    if os.path.exists(output_npy):
-        existing_embs = np.load(output_npy).astype("float32")
+    if output_npy_path.exists():
+        existing_embs = np.load(output_npy_path).astype("float32")
         vec_offset = existing_embs.shape[0]
-        if os.path.exists(output_jsonl):
-            with open(output_jsonl, "rt", encoding="utf-8") as f_old:
+        if output_jsonl_path.exists():
+            with open(output_jsonl_path, "rt", encoding="utf-8") as f_old:
                 idx = -1
                 for idx, line in enumerate(f_old):
                     if json.loads(line).get("vec_id") != idx:
                         raise AssertionError(
-                            f"vec_id mismatch at line {idx} in {output_jsonl}"
+                            f"vec_id mismatch at line {idx} in {output_jsonl_path}"
                         )
                 if vec_offset != idx + 1:
                     raise AssertionError(
@@ -127,7 +135,7 @@ def embed_and_save(
             embs_all = np.empty(
                 (0, model.get_sentence_embedding_dimension()), dtype="float32"
             )
-        print(f"[Embeddings] No new items for {input_jsonl}; skipping.")
+        logger.info(f"[Embeddings] No new items for {input_path}; skipping.")
         return embs_all, np.empty(
             (0, embs_all.shape[1] if embs_all.size else 0), dtype="float32"
         )
@@ -143,29 +151,23 @@ def embed_and_save(
     for i, entry in enumerate(data):
         entry["vec_id"] = i + vec_offset
 
-    dir_path = os.path.dirname(output_npy)
-    os.makedirs(dir_path or ".", exist_ok=True)
+    output_npy_path.parent.mkdir(parents=True, exist_ok=True)
     if existing_embs is not None:
         embs_all = np.vstack([existing_embs, new_embs])
     else:
         embs_all = new_embs
-    np.save(output_npy, embs_all)
+    np.save(output_npy_path, embs_all)
 
     mode = "a" if vec_offset > 0 else "w"
-    dir_path = os.path.dirname(output_jsonl)
-    os.makedirs(dir_path or ".", exist_ok=True)
-    with open(output_jsonl, mode + "t", encoding="utf-8") as f_out:
+    output_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_jsonl_path, mode + "t", encoding="utf-8") as f_out:
         for d in data:
-            # ``ensure_ascii=False`` preserves non-ASCII characters in the
-            # stored metadata, keeping a 1:1 correspondence with the source
-            # passages.
             f_out.write(json.dumps(d, ensure_ascii=False) + "\n")
 
-    print(
-        f"[Embeddings] Saved {len(data)} new vectors to {output_npy} and updated JSONL {output_jsonl}"
+    logger.info(
+        f"[Embeddings] Saved {len(data)} new vectors to {output_npy_path} and updated JSONL {output_jsonl_path}"
     )
     return embs_all, new_embs
-
 
 """################## FAISS indexing ##################"""
 

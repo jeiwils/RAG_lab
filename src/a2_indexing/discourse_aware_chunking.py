@@ -7,7 +7,16 @@ import os
 import re
 from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 
-from src.a2_indexing.chunking import Chunk, make_chunk_id
+from src.a2_indexing.chunking import (
+    Chunk,
+    _chunk_long_unit,
+    _length_fn,
+    _normalise_length_unit,
+    _overlap_units,
+    _reindex,
+    _trim_span,
+    make_chunk_id,
+)
 from src.utils.__utils__ import append_jsonl, existing_ids, load_jsonl
 from src.utils.algorithms.discourse_aware import (
     find_anaphora_markers,
@@ -87,18 +96,6 @@ class _ChunkSpan:
     end_aligned: bool
 
 
-_TOKEN_RE = re.compile(r"\S+")
-
-
-def _normalise_length_unit(length_unit: str) -> str:
-    value = length_unit.strip().lower()
-    if value in {"token", "tokens"}:
-        return "tokens"
-    if value in {"char", "chars", "character", "characters"}:
-        return "chars"
-    raise ValueError(f"Unsupported length_unit value: {length_unit}")
-
-
 def _validate_config(config: DiscourseAwareChunkingConfig) -> DiscourseAwareChunkingConfig:
     if config.max_length <= 0:
         raise ValueError("max_length must be positive.")
@@ -114,27 +111,6 @@ def _validate_config(config: DiscourseAwareChunkingConfig) -> DiscourseAwareChun
         raise ValueError("extension_sentences cannot be negative.")
     _normalise_length_unit(config.length_unit)
     return config
-
-
-def _length_fn(config: DiscourseAwareChunkingConfig):
-    if _normalise_length_unit(config.length_unit) == "chars":
-        return len
-    return lambda s: len(_TOKEN_RE.findall(s))
-
-
-def _trim_span(text: str, start: int, end: int, strip_whitespace: bool) -> Tuple[int, int, str]:
-    if not strip_whitespace:
-        return start, end, text[start:end]
-    span = text[start:end]
-    if not span:
-        return start, end, ""
-    left_trim = len(span) - len(span.lstrip())
-    right_trim = len(span) - len(span.rstrip())
-    start += left_trim
-    end -= right_trim
-    if start >= end:
-        return start, end, ""
-    return start, end, text[start:end]
 
 
 def _build_sentence_units(
@@ -162,79 +138,6 @@ def _units_to_chunk(
     start, end, chunk_text = _trim_span(text, start, end, config.strip_whitespace)
     length = length_fn(chunk_text)
     return Chunk(text=chunk_text, index=-1, start=start, end=end, length=length)
-
-
-def _overlap_units(units: Sequence[_SentenceUnit], overlap: int) -> List[_SentenceUnit]:
-    if overlap <= 0 or not units:
-        return []
-    total = 0
-    suffix: List[_SentenceUnit] = []
-    for unit in reversed(units):
-        if suffix and total >= overlap:
-            break
-        suffix.append(unit)
-        total += unit.length
-        if total >= overlap:
-            break
-    return list(reversed(suffix))
-
-
-def _chunk_long_unit(
-    unit: _SentenceUnit,
-    text: str,
-    config: DiscourseAwareChunkingConfig,
-    length_fn,
-) -> List[Chunk]:
-    chunks: List[Chunk] = []
-    max_len = config.max_length
-    overlap = config.overlap
-    step = max_len - overlap
-    if step <= 0:
-        raise ValueError("overlap must be smaller than max_length.")
-
-    if _normalise_length_unit(config.length_unit) == "chars":
-        start = unit.start
-        while start < unit.end:
-            end = min(start + max_len, unit.end)
-            start, end, span = _trim_span(text, start, end, config.strip_whitespace)
-            if span:
-                chunks.append(
-                    Chunk(
-                        text=span,
-                        index=-1,
-                        start=start,
-                        end=end,
-                        length=length_fn(span),
-                    )
-                )
-            if end >= unit.end:
-                break
-            start = end - overlap
-        return chunks
-
-    tokens = list(_TOKEN_RE.finditer(unit.text))
-    if not tokens:
-        return chunks
-    for i in range(0, len(tokens), step):
-        window = tokens[i : i + max_len]
-        if not window:
-            break
-        start = unit.start + window[0].start()
-        end = unit.start + window[-1].end()
-        start, end, span = _trim_span(text, start, end, config.strip_whitespace)
-        if span:
-            chunks.append(
-                Chunk(
-                    text=span,
-                    index=-1,
-                    start=start,
-                    end=end,
-                    length=length_fn(span),
-                )
-            )
-        if i + max_len >= len(tokens):
-            break
-    return chunks
 
 
 def _chunk_sentence_units(
@@ -368,19 +271,6 @@ def _merge_short_tail(
         end_aligned=spans[-1].end_aligned,
     )
     return chunks[:-2] + [merged], spans[:-2] + [merged_span]
-
-
-def _reindex(chunks: List[Chunk]) -> List[Chunk]:
-    return [
-        Chunk(
-            text=chunk.text,
-            index=i,
-            start=chunk.start,
-            end=chunk.end,
-            length=chunk.length,
-        )
-        for i, chunk in enumerate(chunks)
-    ]
 
 
 def _marker_spans(text: str, config: DiscourseAwareChunkingConfig) -> List[Tuple[int, int]]:
@@ -520,33 +410,19 @@ def chunk_record(
     copy_fields: Sequence[str] = (),
 ) -> List[Dict]:
     """Chunk a single record into chunk dictionaries."""
-    if text_field not in record:
-        raise KeyError(f"Missing {text_field} in record.")
-    if id_field not in record:
-        raise KeyError(f"Missing {id_field} in record.")
+    from src.a2_indexing.chunking import _chunk_record_generic
 
-    text = record[text_field]
-    source_id = record[id_field]
-    chunks = chunk_text(text, config)
-
-    output: List[Dict] = []
-    for chunk in chunks:
-        chunk_id = make_chunk_id(str(source_id), chunk.index)
-        item = {
-            output_id_field: chunk_id,
-            parent_id_field: source_id,
-            "chunk_index": chunk.index,
-            "text": chunk.text,
-            "char_start": chunk.start,
-            "char_end": chunk.end,
-        }
-        if title_field and title_field in record:
-            item[title_field] = record[title_field]
-        for field in copy_fields:
-            if field in record:
-                item[field] = record[field]
-        output.append(item)
-    return output
+    return _chunk_record_generic(
+        record,
+        config,
+        chunk_text,
+        text_field=text_field,
+        id_field=id_field,
+        title_field=title_field,
+        output_id_field=output_id_field,
+        parent_id_field=parent_id_field,
+        copy_fields=copy_fields,
+    )
 
 
 def chunk_records(
@@ -561,18 +437,19 @@ def chunk_records(
     copy_fields: Sequence[str] = (),
 ) -> Iterator[Dict]:
     """Yield chunk dictionaries for an iterable of records."""
-    for record in records:
-        for chunk in chunk_record(
-            record,
-            config,
-            text_field=text_field,
-            id_field=id_field,
-            title_field=title_field,
-            output_id_field=output_id_field,
-            parent_id_field=parent_id_field,
-            copy_fields=copy_fields,
-        ):
-            yield chunk
+    from src.a2_indexing.chunking import _chunk_records_generic
+
+    return _chunk_records_generic(
+        records,
+        config,
+        chunk_text,
+        text_field=text_field,
+        id_field=id_field,
+        title_field=title_field,
+        output_id_field=output_id_field,
+        parent_id_field=parent_id_field,
+        copy_fields=copy_fields,
+    )
 
 
 def chunk_jsonl(
@@ -590,32 +467,19 @@ def chunk_jsonl(
     overwrite: bool = False,
 ) -> str:
     """Chunk a JSONL file and write chunked records to ``output_path``."""
-    if os.path.exists(output_path):
-        if overwrite:
-            os.remove(output_path)
-        elif not resume:
-            raise FileExistsError(
-                f"{output_path} exists. Use overwrite=True or resume=True."
-            )
+    from src.a2_indexing.chunking import _chunk_jsonl_generic
 
-    done_sources = set()
-    if resume and os.path.exists(output_path):
-        done_sources = existing_ids(output_path, id_field=parent_id_field)
-
-    for record in load_jsonl(input_path):
-        source_id = record.get(id_field)
-        if resume and source_id in done_sources:
-            continue
-        for chunk in chunk_record(
-            record,
-            config,
-            text_field=text_field,
-            id_field=id_field,
-            title_field=title_field,
-            output_id_field=output_id_field,
-            parent_id_field=parent_id_field,
-            copy_fields=copy_fields,
-        ):
-            append_jsonl(output_path, chunk)
-
-    return output_path
+    return _chunk_jsonl_generic(
+        input_path,
+        output_path,
+        config,
+        chunk_text,
+        text_field=text_field,
+        id_field=id_field,
+        title_field=title_field,
+        output_id_field=output_id_field,
+        parent_id_field=parent_id_field,
+        copy_fields=copy_fields,
+        resume=resume,
+        overwrite=overwrite,
+    )

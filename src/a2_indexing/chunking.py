@@ -1,9 +1,10 @@
 """Chunking utilities for splitting text into fixed-length segments."""
 
 from __future__ import annotations
-import pysbd
+import spacy
 from dataclasses import dataclass
 import os
+import string
 from pathlib import Path
 import re
 from typing import Dict, Iterable, Iterator, List, Sequence, Tuple, TYPE_CHECKING
@@ -22,7 +23,6 @@ __all__ = [
     "chunk_records",
     "chunk_text",
     "make_chunk_id",
-    "_ensure_chunked_passages",
 ]
 
 # ---------------------------------------------------------------------------
@@ -153,26 +153,43 @@ def _trim_span(text: str, start: int, end: int, strip_whitespace: bool) -> Tuple
     return start, end, text[start:end]
 
 
-_SBD_SEGMENTER = pysbd.Segmenter(language="en", clean=False)
+_SPACY_NLP = spacy.blank("en")
+_SPACY_NLP.add_pipe("sentencizer")
+
 
 def _iter_spans(text: str, split_on: str) -> Iterator[Tuple[int, int]]:
     mode = _normalise_split_on(split_on)
     
     # Sentence splitting using pysbd; follow with CLI-style character offsets.
     if mode == "sentence":
-        start = 0
-        for sentence in _SBD_SEGMENTER.segment(text):
-            try:
-                idx = text.index(sentence, start)
-            except ValueError:
-                idx = start
-            end = idx + len(sentence)
-            if idx < end:
-                yield idx, end
-            start = end
-        if start < len(text):
-            yield start, len(text)
-        return
+        if len(text) > 5000:
+            yield 0, len(text), text
+            return
+
+        # STRIKE 2: Massive unbroken strings
+        if re.search(r'\S{150,}', text):
+            yield 0, len(text), text
+            return
+
+        # STRIKE 3: Repeating identical punctuation
+        if re.search(r'([^\w\s])\1{15,}', text):
+            yield 0, len(text), text
+            return
+            
+        # STRIKE 4: Punctuation Density (The Ultimate Garbage Filter)
+        # If the text is long enough, and more than 20% of it is punctuation, it's not prose.
+        if len(text) > 100:
+            punct_count = sum(1 for c in text if c in string.punctuation)
+            if punct_count / len(text) > 0.2:
+                yield 0, len(text), text
+                return
+
+    # THE DEBUGGER: Print the length and the first 150 characters right before SpaCy
+    #print(f"\n[DEBUG] Sending to SpaCy (Len: {len(text)}): {text[:150]!r}")
+
+    doc = _SPACY_NLP(text)
+    for sent in doc.sents:
+        yield sent.start_char, sent.end_char, sent.text
 
     # Keep your existing logic for other modes
     if mode == "token":
@@ -455,12 +472,15 @@ def _chunk_record_generic(
     chunks = chunk_text_fn(text, config)
 
     output: List[Dict] = []
+    chunk_count = len(chunks)  # <--- Add this
+
     for chunk in chunks:
         chunk_id = make_chunk_id(str(source_id), chunk.index)
         item = {
             output_id_field: chunk_id,
             parent_id_field: source_id,
             "chunk_index": chunk.index,
+            "chunk_count": chunk_count, # <--- Add this
             "text": chunk.text,
             "char_start": chunk.start,
             "char_end": chunk.end,
@@ -654,50 +674,3 @@ def chunk_jsonl(
 
     return str(out_path)
 
-
-def _ensure_chunked_passages(
-    dataset: str,
-    split: str,
-    *,
-    chunking_mode: str,
-    resume: bool,
-    run_chunking: bool,
-    standard_config: ChunkingConfig,
-    discourse_config: "DiscourseAwareChunkingConfig",
-    passages_path: Path | str | None = None,
-) -> Dict[str, Path | str]:
-    if chunking_mode not in {"standard", "discourse_aware"}:
-        raise ValueError(f"Unknown chunking_mode: {chunking_mode}")
-
-    chunk_paths = _chunk_paths(dataset, split, chunking_mode)
-    chunk_paths["base"].mkdir(parents=True, exist_ok=True)
-
-    if not run_chunking and not chunk_paths["chunks_jsonl"].exists():
-        raise FileNotFoundError(
-            f"Chunked passages missing: {chunk_paths['chunks_jsonl']}"
-        )
-
-    if run_chunking:
-        if passages_path is None:
-            src_path = processed_dataset_paths(dataset, split)["passages"]
-        else:
-            src_path = Path(passages_path)
-        if chunking_mode == "discourse_aware":
-            from src.a2_indexing.discourse_aware_chunking import (
-                chunk_jsonl as discourse_aware_chunk_jsonl,
-            )
-
-            config = discourse_config
-            chunk_fn = discourse_aware_chunk_jsonl
-        else:
-            config = standard_config
-            chunk_fn = chunk_jsonl
-        chunk_fn(
-            input_path=str(src_path),
-            output_path=str(chunk_paths["chunks_jsonl"]),
-            config=config,
-            resume=resume,
-            overwrite=not resume,
-        )
-
-    return chunk_paths

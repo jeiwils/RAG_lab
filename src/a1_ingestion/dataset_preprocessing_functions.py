@@ -1,66 +1,30 @@
 """Utilities for processing raw QA datasets into a unified format.
 
 This module exposes a single :func:`process_dataset` helper which converts a
-dataset's raw examples into the project wide question and passage JSONL files.
-Callers must supply a ``field_map`` describing how to extract the necessary
-fields from each example.  Previous wrappers like ``process_hotpotqa`` and the
-``PROCESSORS`` registry have been removed so that new datasets can be processed
-without modifying this module.
-
-Example
--------
-
-To process a HotpotQA style JSON file::
-
-    from src.a_dataset_preprocessing import process_dataset
-    from src.utils import pid_plus_title
-
-    field_map = {
-        "get_id": lambda ex: ex["_id"],
-        "get_question": lambda ex: ex["question"],
-        "get_answer": lambda ex: ex.get("answer", ""),
-        "iter_passages": lambda ex: [
-            (pid_plus_title(ex["_id"], title, i), title, sent)
-            for title, sents in ex["context"]
-            for i, sent in enumerate(sents)
-        ],
-        "gold_passage_ids": lambda ex: [
-            pid_plus_title(ex["_id"], title, idx)
-            for title, idx in ex.get("supporting_facts", [])
-        ],
-    }
-
-    process_dataset(
-        dataset="hotpotqa",
-        split="dev",
-        file_path="data/raw_datasets/hotpotqa/hotpot_dev_fullwiki_v1.json",
-        field_map=field_map,
-    )
-
-The ``field_map`` supplies callables to extract the question id, question
-text, gold answer, passage iterator and gold passage IDs.  The processing logic
-is otherwise dataset agnostic.
+dataset's raw examples into the project-wide question and passage JSONL files.
+It now acts strictly as an extractor, offloading chunking and discourse-aware 
+logic to the dedicated chunking modules via buffered JSONL processing.
 """
 
 from __future__ import annotations
-
+from tqdm import tqdm 
 import csv
 import json
 import random
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Tuple, Set
 
+# Import the new pipeline utilities
 from src.a2_indexing.chunking import (
-    split_long_passage,
-    split_long_passage_discourse_aware,
-    split_long_passage_discourse_aware_with_flags,
+    ChunkingConfig, 
+    chunk_jsonl as standard_chunk_jsonl,
+    chunk_text
 )
-from src.utils.algorithms.discourse_aware import (
-    _expand_sentence_text,
-    _has_anaphora_marker,
-    _has_cataphora_marker,
-    iter_sentence_spans,
+from src.a2_indexing.discourse_aware_chunking import (
+    DiscourseAwareChunkingConfig,
+    chunk_jsonl as da_chunk_jsonl,
 )
+from src.utils.algorithms.discourse_aware import iter_sentence_spans
 from src.utils.__utils__ import (
     append_jsonl,
     clean_text,
@@ -98,11 +62,7 @@ DEFAULT_OUTPUTS = {
     "passages",
     "full_passages",
     "full_passages_chunks",
-    "passages_discourse_aware",
-    "passages_discourse_aware_debug",
-    "passages_discourse_aware_aliases",
     "full_passages_chunks_discourse_aware",
-    "full_passages_chunks_discourse_aware_debug",
 }
 
 ACORD_DEFAULT_POS_THRESHOLD = 3
@@ -116,14 +76,12 @@ def _strip_full_suffix(passage_id: str) -> str:
         return passage_id[: -len("__full")]
     return passage_id
 
-
 def split_text_into_sentences(text: str) -> List[str]:
     cleaned = clean_text(text)
     if not cleaned:
         return []
     sentences = [s.strip() for _, _, s in iter_sentence_spans(cleaned)]
     return [s for s in sentences if s]
-
 
 def sentence_passages_from_full(
     passage_id: str,
@@ -136,13 +94,11 @@ def sentence_passages_from_full(
         for idx, sent in enumerate(sentences)
     ]
 
-
 def sentence_ids_from_full(passage_id: str, text: str) -> List[str]:
     return [
         f"{passage_id}__sent{idx}"
         for idx, _sent in enumerate(split_text_into_sentences(text))
     ]
-
 
 # ---------------------------------------------------------------------------
 # ACORD (queries/corpus/qrels) helpers
@@ -517,7 +473,10 @@ def process_acord_split(
                     },
                 )
             if include_full_passages_chunks:
-                chunks = split_long_passage(text)
+                # Use the new chunk_text function and extract the string text
+                chunk_objects = chunk_text(text, ChunkingConfig())
+                chunks = [c.text for c in chunk_objects]
+                
                 if not chunks:
                     continue
                 if len(chunks) == 1:
@@ -682,15 +641,9 @@ def get_raw_dataset_path(dataset: str, split: str) -> str:
         raise ValueError(f"Missing file_path for dataset: {dataset}")
     return str(file_path)
 
-##### Types
-"""Shared ingestion type aliases."""
-
-FieldMap = Dict[str, Callable[[Dict], Iterable]] #### ?????
-
 ##### Generic dataset processing
 """Generic utilities for mapping raw datasets into a unified JSONL format."""
-
-
+FieldMap = Dict[str, Callable[[Dict[str, Any]], Iterable[Any]]]
 def process_dataset(
     *,
     dataset: str,
@@ -701,42 +654,15 @@ def process_dataset(
     overwrite: bool = False,
     resume: bool = False,
     include_outputs: Iterable[str] | None = None,
+    chunking_config: ChunkingConfig | None = None,
+    da_chunking_config: DiscourseAwareChunkingConfig | None = None,
 ) -> None:
-    """Process ``file_path`` using ``field_map``.
-
-    Parameters
-    ----------
-    dataset:
-        Name of the dataset being processed.
-    split:
-        Dataset split (``train``, ``dev`` ...).
-    file_path:
-        Path to the raw dataset file.  JSON or JSONL files are supported.
-    field_map:
-        Mapping of callables that extract fields from each example.  Required
-        keys are ``get_id``, ``get_question``, ``get_answer``,
-        ``iter_passages`` and ``gold_passage_ids``. Optional keys
-        ``iter_full_passages`` and ``gold_full_passage_ids`` allow writing a
-        separate full-passage JSONL alongside sentence-level passages.
-        The callables operate on a single example and either return a value or
-        an iterable of values.
-    max_examples:
-        Optional limit for the number of examples processed.
-    overwrite:
-        Unused but kept for backward compatibility.
-    resume:
-        Whether to resume from existing processed files.
-    include_outputs:
-        Optional list/set of outputs to write. When ``None``, all outputs are
-        generated. Valid values align with keys from
-        :func:`processed_dataset_paths`.
-    """
+    """Process ``file_path`` using ``field_map`` and pipe to chunking utilities."""
 
     # ---- Load raw examples -------------------------------------------------
-    examples: List[Dict]
+    examples: List[Dict] = []
     with open(file_path, "r", encoding="utf-8") as f:
         if file_path.endswith(".jsonl"):
-            examples = []
             for i, line in enumerate(f):
                 if isinstance(max_examples, int) and i >= max_examples:
                     break
@@ -749,6 +675,7 @@ def process_dataset(
     paths = processed_dataset_paths(dataset, split)
     qa_path = str(paths["questions"])
     passages_path = str(paths["passages"])
+    full_passages_path = str(paths.get("full_passages", ""))
 
     get_id = field_map["get_id"]
     get_question = field_map["get_question"]
@@ -764,502 +691,85 @@ def process_dataset(
 
     include_questions = "questions" in include_outputs
     include_passages = "passages" in include_outputs
-    include_full_passages = "full_passages" in include_outputs
-    include_full_passages_chunks = "full_passages_chunks" in include_outputs
-    include_passages_discourse_aware = "passages_discourse_aware" in include_outputs
-    include_passages_discourse_aware_debug = (
-        "passages_discourse_aware_debug" in include_outputs
-    )
-    include_passages_discourse_aware_aliases = (
-        "passages_discourse_aware_aliases" in include_outputs
-    )
-    include_full_passages_chunks_discourse_aware = (
-        "full_passages_chunks_discourse_aware" in include_outputs
-    )
-    include_full_passages_chunks_discourse_aware_debug = (
-        "full_passages_chunks_discourse_aware_debug" in include_outputs
-    )
-
-    include_discourse_outputs = (
-        include_passages_discourse_aware
-        or include_passages_discourse_aware_debug
-        or include_passages_discourse_aware_aliases
-    )
-    include_da_chunk_outputs = (
-        include_full_passages_chunks_discourse_aware
-        or include_full_passages_chunks_discourse_aware_debug
-    )
-    any_full_outputs = (
-        include_full_passages
-        or include_full_passages_chunks
-        or include_discourse_outputs
-        or include_da_chunk_outputs
-    )
+    include_full_passages = any(o in include_outputs for o in ["full_passages", "full_passages_chunks", "full_passages_chunks_discourse_aware"])
 
     # ---- Determine resume state --------------------------------------------
-    done_qids: set[str] = set()
-    if include_questions:
-        done_qids, _ = compute_resume_sets(
-            resume=resume,
-            out_path=qa_path,
-            items=examples,
-            get_id=lambda ex, i: get_id(ex),
-            phase_label=f"{dataset} {split} questions",
-            id_field="question_id",
-        )
+    done_qids: Set[str] = set()
+    done_pids: Set[str] = set()
+    done_full_pids: Set[str] = set()
 
-    done_pids: set[str] = set()
-    if include_passages:
-        def iter_pids() -> Iterable[str]:
-            for ex in examples:
-                for pid, _title, _text in iter_passages_fn(ex):
-                    yield pid
+    if resume:
+        if include_questions:
+            done_qids, _ = compute_resume_sets(
+                resume=True, out_path=qa_path, items=examples,
+                get_id=lambda ex, i: get_id(ex), phase_label=f"{dataset} q", id_field="question_id"
+            )
 
-        done_pids, _ = compute_resume_sets(
-            resume=resume,
-            out_path=passages_path,
-            items=iter_pids(),
-            get_id=lambda pid, i: pid,
-            phase_label=f"{dataset} {split} passages",
-            id_field="passage_id",
-        )
+        if include_passages:
+            def iter_pids():
+                for ex in examples:
+                    for pid, _, _ in iter_passages_fn(ex): yield pid
+            done_pids, _ = compute_resume_sets(
+                resume=True, out_path=passages_path, items=iter_pids(),
+                get_id=lambda pid, i: pid, phase_label=f"{dataset} p", id_field="passage_id"
+            )
 
-    done_full_pids: set[str] = set()
-    done_full_chunk_pids: set[str] = set()
-    done_full_da_chunk_pids: set[str] = set()
-    done_discourse_pids: set[str] = set()
-    done_discourse_debug_pids: set[str] = set()
-    done_discourse_aliases: set[str] = set()
-    done_full_da_chunk_debug_pids: set[str] = set()
-    full_passages_path: str | None = None
-    full_passages_chunks_path: str | None = None
-    full_passages_chunks_discourse_aware_path: str | None = None
-    passages_discourse_aware_path: str | None = None
-    passages_discourse_aware_debug_path: str | None = None
-    passages_discourse_aware_aliases_path: str | None = None
-    full_passages_chunks_discourse_aware_debug_path: str | None = None
-    if iter_full_passages_fn is not None and any_full_outputs:
-        full_passages_path = str(paths["full_passages"])
-        full_passages_chunks_path = str(paths["full_passages_chunks"])
-        full_passages_chunks_discourse_aware_path = str(
-            paths["full_passages_chunks_discourse_aware"]
-        )
-        passages_discourse_aware_path = str(paths["passages_discourse_aware"])
-        passages_discourse_aware_debug_path = str(
-            paths["passages_discourse_aware_debug"]
-        )
-        passages_discourse_aware_aliases_path = str(
-            paths["passages_discourse_aware_aliases"]
-        )
-        full_passages_chunks_discourse_aware_debug_path = str(
-            paths["full_passages_chunks_discourse_aware_debug"]
-        )
-
-        def iter_full_pids() -> Iterable[str]:
-            for ex in examples:
-                for pid, _title, _text in iter_full_passages_fn(ex):
-                    yield pid
-
-        if include_full_passages:
+        if include_full_passages and iter_full_passages_fn:
+            def iter_full_pids():
+                for ex in examples:
+                    for pid, _, _ in iter_full_passages_fn(ex): yield pid
             done_full_pids, _ = compute_resume_sets(
-                resume=resume,
-                out_path=full_passages_path,
-                items=iter_full_pids(),
-                get_id=lambda pid, i: pid,
-                phase_label=f"{dataset} {split} full passages",
-                id_field="passage_id",
+                resume=True, out_path=full_passages_path, items=iter_full_pids(),
+                get_id=lambda pid, i: pid, phase_label=f"{dataset} fp", id_field="passage_id"
             )
 
-        def iter_full_chunk_pids() -> Iterable[str]:
-            for ex in examples:
-                for pid, _title, text in iter_full_passages_fn(ex):
-                    cleaned = clean_text(text)
-                    chunks = split_long_passage(cleaned)
-                    if not chunks:
-                        continue
-                    if len(chunks) == 1:
-                        yield pid
-                    else:
-                        for idx in range(len(chunks)):
-                            yield f"{pid}__chunk{idx}"
-
-        if include_full_passages_chunks:
-            done_full_chunk_pids, _ = compute_resume_sets(
-                resume=resume,
-                out_path=full_passages_chunks_path,
-                items=iter_full_chunk_pids(),
-                get_id=lambda pid, i: pid,
-                phase_label=f"{dataset} {split} full passage chunks",
-                id_field="passage_id",
-            )
-
-        def iter_full_da_chunk_pids() -> Iterable[str]:
-            for ex in examples:
-                for pid, _title, text in iter_full_passages_fn(ex):
-                    cleaned = clean_text(text)
-                    chunks = split_long_passage_discourse_aware(cleaned)
-                    if not chunks:
-                        continue
-                    if len(chunks) == 1:
-                        yield pid
-                    else:
-                        for idx in range(len(chunks)):
-                            yield f"{pid}__chunk{idx}"
-
-        if include_full_passages_chunks_discourse_aware:
-            done_full_da_chunk_pids, _ = compute_resume_sets(
-                resume=resume,
-                out_path=full_passages_chunks_discourse_aware_path,
-                items=iter_full_da_chunk_pids(),
-                get_id=lambda pid, i: pid,
-                phase_label=f"{dataset} {split} discourse-aware full passage chunks",
-                id_field="passage_id",
-            )
-
-        def iter_discourse_pids() -> Iterable[str]:
-            for ex in examples:
-                for pid, _title, text in iter_full_passages_fn(ex):
-                    cleaned = clean_text(text)
-                    sentences = [s.strip() for _, _, s in iter_sentence_spans(cleaned)]
-                    if not sentences:
-                        continue
-                    expanded_entries: List[Dict[str, object]] = []
-                    covered_by_expansion: set[int] = set()
-                    for idx, sent in enumerate(sentences):
-                        has_anaphora = _has_anaphora_marker(
-                            sent,
-                            include_reformulation=True,
-                            include_parenthetical=True,
-                        )
-                        has_cataphora = _has_cataphora_marker(
-                            sent,
-                            include_reformulation=True,
-                            require_forward_punct=True,
-                        )
-                        _expanded_text, span_start, span_end = _expand_sentence_text(
-                            sentences,
-                            idx,
-                            extension=1,
-                            has_anaphora=has_anaphora,
-                            has_cataphora=has_cataphora,
-                        )
-                        expanded = span_start != span_end
-                        if expanded:
-                            covered_by_expansion.update(range(span_start, span_end + 1))
-                        expanded_entries.append(
-                            {
-                                "idx": idx,
-                                "expanded": expanded,
-                                "span_start": span_start,
-                                "span_end": span_end,
-                            }
-                        )
-
-                    for entry in expanded_entries:
-                        idx = int(entry["idx"])
-                        expanded = bool(entry["expanded"])
-                        base = _strip_full_suffix(pid)
-                        yield f"{base}__sent{idx}"
-
-        if include_passages_discourse_aware or include_passages_discourse_aware_debug:
-            done_discourse_pids, _ = compute_resume_sets(
-                resume=resume,
-                out_path=passages_discourse_aware_path,
-                items=iter_discourse_pids(),
-                get_id=lambda pid, i: pid,
-                phase_label=f"{dataset} {split} discourse-aware passages",
-                id_field="passage_id",
-            )
-        if include_passages_discourse_aware_debug and passages_discourse_aware_debug_path is not None:
-            done_discourse_debug_pids = (
-                existing_ids(passages_discourse_aware_debug_path, id_field="passage_id")
-                if resume
-                else set()
-            )
-        if include_passages_discourse_aware_aliases and passages_discourse_aware_aliases_path is not None:
-            done_discourse_aliases = (
-                existing_ids(
-                    passages_discourse_aware_aliases_path,
-                    id_field="dropped_id",
-                )
-                if resume
-                else set()
-            )
-        if include_full_passages_chunks_discourse_aware_debug and full_passages_chunks_discourse_aware_debug_path is not None:
-            done_full_da_chunk_debug_pids = (
-                existing_ids(
-                    full_passages_chunks_discourse_aware_debug_path,
-                    id_field="passage_id",
-                )
-                if resume
-                else set()
-            )
-
-    # ---- Write processed files ---------------------------------------------
-    for ex in examples:
+    # ---- STEP 1: Extract Base Data -----------------------------------------
+    for ex in tqdm(examples, desc=f"Extracting {dataset} {split}"):
         qid = get_id(ex)
+        
+        # Write Questions
         if include_questions and qid not in done_qids:
-            gold_ids, seen = [], set()
-            for pid in gold_ids_fn(ex):
-                if pid not in seen:
-                    gold_ids.append(pid)
-                    seen.add(pid)
             record = {
                 "question_id": qid,
                 "dataset": dataset,
                 "split": split,
                 "question": clean_text(get_question(ex)),
                 "gold_answer": clean_text(get_answer(ex)),
-                "gold_passages": gold_ids,
+                "gold_passages": list(dict.fromkeys(gold_ids_fn(ex))),
             }
-            if gold_full_ids_fn is not None:
-                gold_full_ids, seen_full = [], set()
-                for pid in gold_full_ids_fn(ex):
-                    if pid not in seen_full:
-                        gold_full_ids.append(pid)
-                        seen_full.add(pid)
-                record["gold_passages_full"] = gold_full_ids
+            if gold_full_ids_fn:
+                record["gold_passages_full"] = list(dict.fromkeys(gold_full_ids_fn(ex)))
             append_jsonl(qa_path, record)
 
+        # Write Sentence Passages
         if include_passages:
             for pid, title, text in iter_passages_fn(ex):
-                if pid in done_pids:
-                    continue
-                append_jsonl(
-                    passages_path,
-                    {
-                        "passage_id": pid,
-                        "title": title,
-                        "text": clean_text(text),
-                    },
-                )
+                if pid not in done_pids:
+                    append_jsonl(passages_path, {"passage_id": pid, "title": title, "text": clean_text(text)})
+                    done_pids.add(pid)
 
-        if iter_full_passages_fn is None or not any_full_outputs:
-            continue
-        for pid, title, text in iter_full_passages_fn(ex):
-            cleaned = clean_text(text)
-            if include_full_passages and pid not in done_full_pids:
-                append_jsonl(
-                    full_passages_path,
-                    {
-                        "passage_id": pid,
-                        "title": title,
-                        "text": cleaned,
-                    },
-                )
-            if include_discourse_outputs:
-                sentences = [s.strip() for _, _, s in iter_sentence_spans(cleaned)]
-                expanded_entries: List[Dict[str, object]] = []
-                covered_by_expansion: set[int] = set()
-                cover_anchor: Dict[int, int] = {}
-                for idx, sent in enumerate(sentences):
-                    has_anaphora = _has_anaphora_marker(
-                        sent,
-                        include_reformulation=True,
-                        include_parenthetical=True,
-                    )
-                    has_cataphora = _has_cataphora_marker(
-                        sent,
-                        include_reformulation=True,
-                        require_forward_punct=True,
-                    )
-                    expanded_text, span_start, span_end = _expand_sentence_text(
-                        sentences,
-                        idx,
-                        extension=1,
-                        has_anaphora=has_anaphora,
-                        has_cataphora=has_cataphora,
-                    )
-                    expanded = span_start != span_end
-                    if expanded:
-                        covered_by_expansion.update(range(span_start, span_end + 1))
-                        for span_idx in range(span_start, span_end + 1):
-                            cover_anchor.setdefault(span_idx, idx)
-                    expanded_entries.append(
-                        {
-                            "idx": idx,
-                            "expanded": expanded,
-                            "span_start": span_start,
-                            "span_end": span_end,
-                            "text": expanded_text.strip(),
-                        }
-                    )
+        # Write Full Passages
+        if include_full_passages and iter_full_passages_fn:
+            for pid, title, text in iter_full_passages_fn(ex):
+                if pid not in done_full_pids:
+                    append_jsonl(full_passages_path, {"passage_id": pid, "title": title, "text": clean_text(text)})
+                    done_full_pids.add(pid)
 
-                base = _strip_full_suffix(pid)
-                for entry in expanded_entries:
-                    idx = int(entry["idx"])
-                    expanded = bool(entry["expanded"])
-                    passage_id = f"{base}__sent{idx}"
-                    anchor_idx = cover_anchor.get(idx)
-                    if not expanded and anchor_idx is not None and anchor_idx != idx:
-                        if include_passages_discourse_aware_aliases:
-                            if passage_id not in done_discourse_aliases:
-                                kept_id = f"{base}__sent{anchor_idx}"
-                                append_jsonl(
-                                    passages_discourse_aware_aliases_path,
-                                    {
-                                        "dropped_id": passage_id,
-                                        "kept_id": kept_id,
-                                        "source_id": pid,
-                                        "dropped_idx": idx,
-                                        "anchor_idx": anchor_idx,
-                                    },
-                                )
-                                done_discourse_aliases.add(passage_id)
-                        continue
-                    if include_passages_discourse_aware:
-                        if passage_id in done_discourse_pids:
-                            continue
-                        append_jsonl(
-                            passages_discourse_aware_path,
-                            {
-                                "passage_id": passage_id,
-                                "source_id": pid,
-                                "expanded": expanded,
-                                "title": title,
-                                "text": str(entry["text"]),
-                            },
-                        )
-                        done_discourse_pids.add(passage_id)
-                    if (
-                        include_passages_discourse_aware_debug
-                        and expanded
-                        and passage_id not in done_discourse_debug_pids
-                    ):
-                        append_jsonl(
-                            passages_discourse_aware_debug_path,
-                            {
-                                "passage_id": passage_id,
-                                "source_id": pid,
-                                "sent_idx": idx,
-                                "span_start": int(entry["span_start"]),
-                                "span_end": int(entry["span_end"]),
-                                "expanded": True,
-                                "title": title,
-                                "text": str(entry["text"]),
-                            },
-                        )
-                        done_discourse_debug_pids.add(passage_id)
-            if include_full_passages_chunks:
-                chunks = split_long_passage(cleaned)
-                if chunks:
-                    if len(chunks) == 1:
-                        chunk_id = pid
-                        if chunk_id not in done_full_chunk_pids:
-                            append_jsonl(
-                                full_passages_chunks_path,
-                                {
-                                    "passage_id": chunk_id,
-                                    "source_id": pid,
-                                    "chunk_index": 0,
-                                    "chunk_count": 1,
-                                    "title": title,
-                                    "text": chunks[0],
-                                },
-                            )
-                    else:
-                        for idx, chunk_text in enumerate(chunks):
-                            chunk_id = f"{pid}__chunk{idx}"
-                            if chunk_id in done_full_chunk_pids:
-                                continue
-                            append_jsonl(
-                                full_passages_chunks_path,
-                                {
-                                    "passage_id": chunk_id,
-                                    "source_id": pid,
-                                    "chunk_index": idx,
-                                    "chunk_count": len(chunks),
-                                    "title": title,
-                                    "text": chunk_text,
-                                },
-                            )
+    # ---- STEP 2: Pipe through Chunking Modules -----------------------------
+    if full_passages_path and Path(full_passages_path).exists():
+        if "full_passages_chunks" in include_outputs:
+            standard_chunk_jsonl(
+                input_path=full_passages_path, output_path=str(paths["full_passages_chunks"]),
+                config=chunking_config or ChunkingConfig(), resume=resume, overwrite=overwrite,
+                id_field="passage_id", parent_id_field="source_id", copy_fields=("title",)
+            )
 
-            if include_da_chunk_outputs:
-                da_chunks, da_extended_flags = (
-                    split_long_passage_discourse_aware_with_flags(cleaned)
-                )
-                if not da_chunks:
-                    continue
-                if len(da_chunks) == 1:
-                    chunk_id = pid
-                    if (
-                        include_full_passages_chunks_discourse_aware
-                        and chunk_id not in done_full_da_chunk_pids
-                    ):
-                        append_jsonl(
-                            full_passages_chunks_discourse_aware_path,
-                            {
-                                "passage_id": chunk_id,
-                                "source_id": pid,
-                                "chunk_index": 0,
-                                "chunk_count": 1,
-                                "title": title,
-                                "text": da_chunks[0],
-                            },
-                        )
-                        done_full_da_chunk_pids.add(chunk_id)
-                    if (
-                        include_full_passages_chunks_discourse_aware_debug
-                        and chunk_id not in done_full_da_chunk_debug_pids
-                    ):
-                        extended = (
-                            bool(da_extended_flags[0]) if da_extended_flags else False
-                        )
-                        if not extended:
-                            continue
-                        append_jsonl(
-                            full_passages_chunks_discourse_aware_debug_path,
-                            {
-                                "passage_id": chunk_id,
-                                "source_id": pid,
-                                "chunk_index": 0,
-                                "chunk_count": 1,
-                                "title": title,
-                                "text": da_chunks[0],
-                                "extended": True,
-                            },
-                        )
-                        done_full_da_chunk_debug_pids.add(chunk_id)
-                    continue
-                for idx, chunk_text in enumerate(da_chunks):
-                    chunk_id = f"{pid}__chunk{idx}"
-                    if (
-                        include_full_passages_chunks_discourse_aware
-                        and chunk_id not in done_full_da_chunk_pids
-                    ):
-                        append_jsonl(
-                            full_passages_chunks_discourse_aware_path,
-                            {
-                                "passage_id": chunk_id,
-                                "source_id": pid,
-                                "chunk_index": idx,
-                                "chunk_count": len(da_chunks),
-                                "title": title,
-                                "text": chunk_text,
-                            },
-                        )
-                        done_full_da_chunk_pids.add(chunk_id)
-                    if (
-                        include_full_passages_chunks_discourse_aware_debug
-                        and chunk_id not in done_full_da_chunk_debug_pids
-                    ):
-                        extended = idx < len(da_extended_flags) and da_extended_flags[idx]
-                        if not extended:
-                            continue
-                        append_jsonl(
-                            full_passages_chunks_discourse_aware_debug_path,
-                            {
-                                "passage_id": chunk_id,
-                                "source_id": pid,
-                                "chunk_index": idx,
-                                "chunk_count": len(da_chunks),
-                                "title": title,
-                                "text": chunk_text,
-                                "extended": True,
-                            },
-                        )
-                        done_full_da_chunk_debug_pids.add(chunk_id)
-
+        if "full_passages_chunks_discourse_aware" in include_outputs:
+            da_chunk_jsonl(
+                input_path=full_passages_path, output_path=str(paths["full_passages_chunks_discourse_aware"]),
+                config=da_chunking_config or DiscourseAwareChunkingConfig(), resume=resume, overwrite=overwrite,
+                id_field="passage_id", parent_id_field="source_id", copy_fields=("title",)
+            )
 
 ##### Ingestion pipeline helpers
 """Dataset-specific ingestion helpers for orchestrators."""

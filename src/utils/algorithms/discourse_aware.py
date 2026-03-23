@@ -1,14 +1,21 @@
-"""Regex-only discourse marker detection for anaphora, cataphora, and parentheticals.
+"""Discourse marker detection for anaphora, cataphora, and parentheticals.
 
+Uses pysbd for robust sentence boundary detection (matching chunking.py).
 Lists and patterns follow the Category A-G markers supplied in the prompt.
-Heuristics are intentionally lightweight and rely only on regular expressions.
+Heuristics are intentionally lightweight and rely only on regular expressions for marker detection.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Iterable, Pattern, Sequence, Tuple
+import string
+
+import spacy
+
+logger = logging.getLogger(__name__)
 
 ###########################################################################
 # Marker categories (from the prompt)
@@ -194,6 +201,14 @@ PARENTHESIS_RE = re.compile(r"\([^)]*\)")
 FORWARD_FOLLOW_RE = re.compile(r"^\s*[:;]")
 
 ###########################################################################
+# Sentence boundary detection (pysbd)
+###########################################################################
+
+# Initialize a blank English pipeline and add only the sentence boundary detector
+_SPACY_NLP = spacy.blank("en")
+_SPACY_NLP.add_pipe("sentencizer")
+
+###########################################################################
 # Data model
 ###########################################################################
 
@@ -214,14 +229,40 @@ class MarkerHit:
 ###########################################################################
 
 
-def iter_sentence_spans(text: str) -> Iterable[Tuple[int, int, str]]:
-    """Yield (start, end, sentence_text) spans using a lightweight regex splitter."""
-    masked = _mask_sentence_dots(text)
-    for match in SENTENCE_RE.finditer(masked):
-        sentence = text[match.start() : match.end()]
-        if not sentence.strip():
-            continue
-        yield match.start(), match.end(), sentence
+def iter_sentence_spans(text: str):
+    """Yields (start_char, end_char, sentence_text) using SpaCy."""
+    if not text:
+        return
+        
+    # STRIKE 1: Length limit
+    if len(text) > 5000:
+        yield 0, len(text), text
+        return
+
+    # STRIKE 2: Massive unbroken strings
+    if re.search(r'\S{150,}', text):
+        yield 0, len(text), text
+        return
+
+    # STRIKE 3: Repeating identical punctuation
+    if re.search(r'([^\w\s])\1{15,}', text):
+        yield 0, len(text), text
+        return
+        
+    # STRIKE 4: Punctuation Density (The Ultimate Garbage Filter)
+    # If the text is long enough, and more than 20% of it is punctuation, it's not prose.
+    if len(text) > 100:
+        punct_count = sum(1 for c in text if c in string.punctuation)
+        if punct_count / len(text) > 0.2:
+            yield 0, len(text), text
+            return
+
+    # THE DEBUGGER: Print the length and the first 150 characters right before SpaCy
+    #print(f"\n[DEBUG] Sending to SpaCy (Len: {len(text)}): {text[:150]!r}")
+
+    doc = _SPACY_NLP(text)
+    for sent in doc.sents:
+        yield sent.start_char, sent.end_char, sent.text
 
 
 def _dedupe_by_span(hits: list[MarkerHit]) -> list[MarkerHit]:
@@ -384,7 +425,6 @@ def find_parentheses(text: str) -> list[Tuple[int, int, str]]:
 # Public detection API
 ###########################################################################
 
-
 def find_anaphora_markers(
     text: str,
     *,
@@ -392,6 +432,10 @@ def find_anaphora_markers(
     include_parenthetical: bool = True,
 ) -> list[MarkerHit]:
     """Find backward-dependent linking markers."""
+    if not text:
+        logger.warning("Empty input text; returning empty list")
+        return []
+
     hits: list[MarkerHit] = []
     hits.extend(
         find_sentence_initial_markers(

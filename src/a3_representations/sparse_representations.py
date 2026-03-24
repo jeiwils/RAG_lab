@@ -7,15 +7,18 @@ import logging
 import os
 import re
 import unicodedata
+from typing import Set
 
 import spacy
+from tqdm import tqdm
 
 from src.utils.__utils__ import clean_text
 
 ### SPACY
 SPACY_MODEL = os.environ.get("SPACY_MODEL", "en_core_web_sm")
 
-nlp = spacy.load(SPACY_MODEL, disable=["parser", "textcat"])
+# OPTIMIZED: Excluded unused pipes (including lemmatizer) to save RAM and initialization time
+nlp = spacy.load(SPACY_MODEL, exclude=["parser", "textcat", "lemmatizer"])
 logger = logging.getLogger(__name__)
 
 ### NORMALIZATION
@@ -120,10 +123,11 @@ def extract_keywords(text: str) -> list[str]:
                     out.add(canon)
     return sorted(out)
 
+
 def add_keywords_to_passages_jsonl(
     passages_jsonl: str,
     only_ids: Set[str] | None = None,
-    batch_size: int = 1000,
+    batch_size: int = 50,  # Lowered from 1000 for better multiprocess stability
 ):
     """Add keywords to passages in a JSONL file.
 
@@ -148,17 +152,25 @@ def add_keywords_to_passages_jsonl(
     else:
         targets = rows
 
-    texts = [r.get("text", "") for r in targets]
-    docs = list(nlp.pipe(texts, batch_size=batch_size, n_process=1))
+    if not targets:
+        logger.info("No targets to process.")
+        return
 
-    for r, doc in zip(targets, docs):
+    texts = [r.get("text", "") for r in targets]
+    
+    # OPTIMIZED: Initialize the pipe with 24 processes and stream it
+    generator = nlp.pipe(texts, batch_size=batch_size, n_process=2)
+
+    # OPTIMIZED: Wrap the zipping of targets and the generator in tqdm
+    for r, doc in tqdm(zip(targets, generator), total=len(texts), desc="Extracting Keywords (24 Cores)"):
         kws = set()
         for ent in doc.ents:
             if ent.label_ in KEEP_ENTS and ent.text.strip():
                 norm = normalise_text(ent.text)
-                canon = canonicalize_keyword(norm)
-                if canon:
-                    kws.add(canon)
+                if norm:
+                    canon = canonicalize_keyword(norm)
+                    if canon:
+                        kws.add(canon)
         r["keywords_passage"] = sorted(kws)
 
     try:

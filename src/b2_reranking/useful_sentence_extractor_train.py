@@ -50,7 +50,7 @@ DEFAULT_MAX_GRAD_NORM = 1.0
 
 ### LORA/GRID SEARCH SETTINGS
 
-RUN_GRID_SEARCH = True
+RUN_GRID_SEARCH = False # will train on only 'BEST_GRID_RUN_KWARGS' if False
 
 BEST_GRID_RUN_KWARGS = {
     "hard_negatives": 8,
@@ -206,11 +206,7 @@ def train(
     local_files_only: bool = LOCAL_FILES_ONLY,
     device: str | torch.device | None = None,
 ):
-    """Train a LoRA sentence usefulness classifier.
 
-    ``train_path``/``dev_path`` refer to processed question JSONL files.
-    Use ``train_passages_path``/``dev_passages_path`` to override passages.
-    """
     get_scheduler = get_linear_schedule_with_warmup
 
     if seed is not None:

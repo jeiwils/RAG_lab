@@ -156,42 +156,34 @@ def _trim_span(text: str, start: int, end: int, strip_whitespace: bool) -> Tuple
 _SPACY_NLP = spacy.blank("en")
 _SPACY_NLP.add_pipe("sentencizer")
 
-
 def _iter_spans(text: str, split_on: str) -> Iterator[Tuple[int, int]]:
     mode = _normalise_split_on(split_on)
     
-    # Sentence splitting using pysbd; follow with CLI-style character offsets.
     if mode == "sentence":
+        # Length limit
         if len(text) > 5000:
-            yield 0, len(text), text
+            yield 0, len(text)
             return
 
-        # STRIKE 2: Massive unbroken strings
-        if re.search(r'\S{150,}', text):
-            yield 0, len(text), text
-            return
-
-        # STRIKE 3: Repeating identical punctuation
-        if re.search(r'([^\w\s])\1{15,}', text):
-            yield 0, len(text), text
+        # Unbroken strings and repeating punctuation
+        if re.search(r'\S{150,}', text) or re.search(r'([^\w\s])\1{15,}', text):
+            yield 0, len(text)
             return
             
-        # STRIKE 4: Punctuation Density (The Ultimate Garbage Filter)
-        # If the text is long enough, and more than 20% of it is punctuation, it's not prose.
+        # Punctuation Density 
         if len(text) > 100:
             punct_count = sum(1 for c in text if c in string.punctuation)
             if punct_count / len(text) > 0.2:
-                yield 0, len(text), text
+                yield 0, len(text)
                 return
 
-    # THE DEBUGGER: Print the length and the first 150 characters right before SpaCy
-    #print(f"\n[DEBUG] Sending to SpaCy (Len: {len(text)}): {text[:150]!r}")
+        doc = _SPACY_NLP(text)
+        for sent in doc.sents:
+            yield sent.start_char, sent.end_char
+            
+        # Stop executing so we don't hit the ValueError at the bottom!
+        return
 
-    doc = _SPACY_NLP(text)
-    for sent in doc.sents:
-        yield sent.start_char, sent.end_char, sent.text
-
-    # Keep your existing logic for other modes
     if mode == "token":
         for m in _TOKEN_RE.finditer(text):
             yield m.start(), m.end()
@@ -216,6 +208,7 @@ def _iter_spans(text: str, split_on: str) -> Iterator[Tuple[int, int]]:
         if start < len(text):
             yield start, len(text)
         return
+        
     raise ValueError(f"Unsupported split_on mode: {split_on}")
 
 

@@ -1,12 +1,9 @@
 """Orchestrator for building dense/sparse passage representations."""
-
 from __future__ import annotations
 
+import numpy as np
 import os
 from pathlib import Path
-
-import numpy as np
-
 from src.a3_representations.dense_representations import (
     build_and_save_faiss_index,
     embed_and_save,
@@ -36,7 +33,7 @@ DATASETS = [
     #"2wikimultihopqa",
     #"natural_questions",
 ]
-SPLITS = ["val", "dev"] #["train_sub", "val", "dev"]
+SPLITS = ["val", "dev"] 
 PASSAGE_SOURCES = ["passages", "full_passages_chunks"]
 
 ### RUN CONTROL
@@ -48,15 +45,12 @@ def main() -> None:
 
     bge_model = get_embedding_model()
 
-    # -------------------------------
-    # Phase A: Passages (Dataset-only)
-    # -------------------------------
     for dataset in DATASETS:
         for split in SPLITS:
             for passage_source in PASSAGE_SOURCES:
                 print(f"\n=== DATASET: {dataset} ({split}) [{passage_source}] ===")
 
-                # File paths
+                # === FILE PATHS ===
                 pass_paths = dataset_rep_paths(
                     dataset, split, passage_source=passage_source
                 )
@@ -96,7 +90,7 @@ def main() -> None:
                         resume=RESUME,
                         out_path=str(passages_jsonl),
                         items=pass_items,
-                        get_id=lambda x, i: x["passage_id"],
+                        get_id=lambda x, i: x.get("passage_id") or x.get("chunk_id"),
                         phase_label="passage embeddings",
                         required_field="vec_id",
                     )
@@ -130,7 +124,6 @@ def main() -> None:
                             output_dir=str(dataset_dir),
                         )
 
-        # Dataset-level phase only handles passage embeddings and indexing.
 
 
 if __name__ == "__main__":

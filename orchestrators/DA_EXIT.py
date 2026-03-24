@@ -1,66 +1,18 @@
-"""
-
-A lightweight, rule-based discourse-aware extension to extractive evidence selection, designed to preserve cohesion and entailment across sentence boundaries.
-
-
-Benchmarking
-- Baselines = EXIT, dense rag, sparse rag, hybrid rag 
-- 1 = EXIT + discourse aware sentence expansion 
-- 2 = EXIT + discourse aware chunking
-- 2 = EXIT + discourse aware sentence expansion and chunking 
-
-
-
-
-1. Retrieve top-k chunks (fixed k, e.g. 20)
-2. Split chunks into sentences
-3. EXIT extractor scores sentences
-4. EXIT adaptively selects sentences
-   (ranked + halting / token budget)
-5. ↓ YOUR ADDITION ↓
-6. Discourse-aware span expansion
-   - pronoun dependency → include antecedent sentence
-   - sentence-initial connectives → include previous sentence
-   - colon / list introducer → include following sentence
-7. Repack expanded spans under the same token budget
-8. Reader generates answer
-
-
-
-
-
-
-
-Offline:
-Gold datasets
- → build sentence-level labels
- → LoRA fine-tuning (binary extractor)
-
-Inference:
-Query
- → retrieve chunks (passages)
- → split chunks into sentences
- → score sentences with trained LoRA extractor 
- → expand sentences with discourse-aware rules
- → select top relevant sentences with trained LoRa extractor under token budget
- → send extracted sentences to reader
- → reader generates answer
-
-
-
-
-"""
-
 from __future__ import annotations
 
+
+import numpy as np
 import json
+import logging
 import os
 import random
+
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # Ensure deterministic CuBLAS when deterministic algorithms are enabled.
 # Must be set before CUDA is initialized.
@@ -111,8 +63,7 @@ __all__ = ["run_da_exit", "main"]
 
 ### DATA & SPLITS
 DATASETS = ["musique"] #["musique", "hotpotqa", "2wikimultihopqa", "natural_questions"]
-# Use val for tuning, dev for final metrics.
-SPLITS = ["val"] # ["val", "dev"]
+SPLITS = ["val", "dev"]
 
 ### RETRIEVAL & PASSAGE
 RETRIEVER_CONFIG = {
@@ -121,7 +72,7 @@ RETRIEVER_CONFIG = {
     "sparse": False,
 }
 TOP_K_CHUNK_SWEEP = [10, 5, 20, 1]
-HYBRID_ALPHA = DEFAULT_HYBRID_ALPHA ## ????
+HYBRID_ALPHA = DEFAULT_HYBRID_ALPHA 
 # Passage source (fixed chunk type).
 PASSAGE_SOURCE = "full_passages_chunks"
 # Sentence mode controls post-ranking expansion for the reader context.
@@ -135,7 +86,7 @@ TAU_LOW_SWEEP = [0.1, 0.15, 0.2, 0.25, 0.35]
 READER_CONTEXT_BUDGET_TOKENS = 800
 
 ### READER
-READER_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+READER_MODEL = "Mistral/Mistral-7B-Instruct-v0.1.Q4_0.gguf" 
 SERVER_URL = "http://localhost:8005"
 USE_IN_PROCESS_READER = False
 IN_PROCESS_READER_LOCAL_FILES_ONLY = True
@@ -143,7 +94,6 @@ IN_PROCESS_READER_LOCAL_FILES_ONLY = True
 ### LORA / RERANKER
 SENTENCE_GRADER_MODEL = (
     "data/models/useful_sentence_lora/grid/"
-    "run3_transfer_underfit_hn8_rn2_pw1.0_lr3e-05_ep2_r16_a16_d0.05_bs16_wd0.01/"
     "checkpoint-epoch2"
 )
 SENTENCE_LORA_BATCH_SIZE = 32
@@ -176,7 +126,6 @@ def run_da_exit(
     resume: bool,
     tau_low: float,
 ) -> Dict[str, Any]:
-    """Run DA_EXIT for a dataset/split/retriever and return summary metrics."""
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
@@ -202,16 +151,41 @@ def run_da_exit(
     passage_source = PASSAGE_SOURCE
 
     rep_paths = dataset_rep_paths(dataset, split, passage_source=passage_source)
-    metadata, index = load_chunk_representations(rep_paths)
-    encoder = get_embedding_model() if retriever in {"dense", "hybrid"} else None
+    try:
+        metadata, index = load_chunk_representations(rep_paths)
+    except FileNotFoundError as e:
+        logger.error(f"Missing representations for {dataset}/{split}: {e}")
+        return {}
+    except ValueError as e:
+        logger.error(f"Corrupted representations: {e}")
+        return {}
+
+    encoder = None
+    if retriever in {"dense", "hybrid"}:
+        try:
+            encoder = get_embedding_model()
+        except Exception as e:
+            logger.error(f"Failed to load embedding model for {retriever} retrieval: {e}")
+            return {}
 
     questions_path = processed_paths["questions"]
-    questions = limit_questions(
-        list(load_jsonl(str(questions_path))),
-        max_questions=MAX_QUESTIONS,
-        seed=seed,
-        shuffle=SHUFFLE_QUESTIONS,
-    )
+    try:
+        questions = limit_questions(
+            list(load_jsonl(str(questions_path))),
+            max_questions=MAX_QUESTIONS,
+            seed=seed,
+            shuffle=SHUFFLE_QUESTIONS,
+        )
+    except FileNotFoundError:
+        logger.error(f"Questions file not found: {questions_path}")
+        return {}
+    except Exception as e:
+        logger.error(f"Failed to load questions: {e}")
+        return {}
+
+    if not questions:
+        logger.warning(f"No questions found in {questions_path}")
+        return {}
 
     method_prefix = "exit" if sentence_mode == "standard_sentences" else "da_exit"
     tau_tag = f"tau{tau_low}".replace(".", "p")
@@ -257,10 +231,16 @@ def run_da_exit(
     precision_at_k_scores: List[float] = []
 
     for q in tqdm(questions, desc=f"{dataset}/{split}/{retriever}"):
-        q_id = q["question_id"]
+        q_id = q.get("question_id")
+        if not q_id:
+            logger.warning("Question missing question_id, skipping")
+            continue
         if resume and q_id in done_ids:
             continue
-        q_text = q.get("question", "")
+        q_text = q.get("question", "").strip()
+        if not q_text:
+            logger.warning(f"Question {q_id} has no text, skipping")
+            continue
         gold[q_id] = [q.get("gold_answer", "")]
 
         def _run_query():
@@ -481,13 +461,49 @@ def run_da_exit(
                 "reader_wall_time_sec": reader_wall_time_sec,
             }
 
-        result, query_wall_sec = wall_time(_run_query)
+        try:
+            result, query_wall_sec = wall_time(_run_query)
+        except Exception as e:
+            logger.error(f"Query {q_id} failed: {e}")
+            # Use default values for this failed query
+            result = {
+                "selected_sentences": [],
+                "answer": {
+                    "raw_answer": "unknown",
+                    "raw_clean": "unknown",
+                    "normalised_answer": "unknown",
+                    "prompt_len": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+                "sentence_tokens": {
+                    "sentence_prompt_tokens": 0,
+                    "sentence_output_tokens": 0,
+                    "sentence_total_tokens": 0,
+                    "n_sentence_calls": 0,
+                },
+                "reader_wall_time_sec": 0.0,
+            }
+            query_wall_sec = 0.0
+
         wall_times.append(query_wall_sec)
         reader_wall_times.append(result.get("reader_wall_time_sec", 0.0))
 
-        selected_sentences = result["selected_sentences"]
-        answer = result["answer"]
-        sentence_tokens = result["sentence_tokens"]
+        selected_sentences = result.get("selected_sentences", [])
+        answer = result.get("answer", {
+            "raw_answer": "unknown",
+            "raw_clean": "unknown",
+            "normalised_answer": "unknown",
+            "prompt_len": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        })
+        sentence_tokens = result.get("sentence_tokens", {
+            "sentence_prompt_tokens": 0,
+            "sentence_output_tokens": 0,
+            "sentence_total_tokens": 0,
+            "n_sentence_calls": 0,
+        })
 
         token_totals["sentence_prompt_tokens"] += sentence_tokens.get(
             "sentence_prompt_tokens", 0
@@ -535,18 +551,18 @@ def run_da_exit(
                 "question": q_text,
                 "raw_answer": answer.get("raw_answer", ""),
                 "normalised_answer": answer.get("normalised_answer", ""),
-                "used_sentence_ids": [s["sentence_id"] for s in selected_sentences],
+                "used_sentence_ids": [s.get("sentence_id", "unknown") for s in selected_sentences],
                 "selected_sentences": [
                     {
-                        "sentence_id": s["sentence_id"],
-                        "chunk_id": s["chunk_id"],
-                        "sent_idx": s["sent_idx"],
-                        "span_start": s.get("span_start", s["sent_idx"]),
-                        "span_end": s.get("span_end", s["sent_idx"]),
+                        "sentence_id": s.get("sentence_id", "unknown"),
+                        "chunk_id": s.get("chunk_id", "unknown"),
+                        "sent_idx": s.get("sent_idx", -1),
+                        "span_start": s.get("span_start", s.get("sent_idx", -1)),
+                        "span_end": s.get("span_end", s.get("sent_idx", -1)),
                         "expanded": s.get("expanded", False),
                         "score": s.get("score", 0),
                         "score_normalized": s.get("score_normalized", 0.0),
-                        "text": s["text"],
+                        "text": s.get("text", ""),
                     }
                     for s in selected_sentences
                 ],
@@ -721,19 +737,18 @@ def run_da_exit(
 
 
 def main() -> None:
-    """Entry point for the DA_EXIT orchestrator.
-
-    Expects processed datasets under data/processed_datasets and precomputed
-    chunk representations under data/representations/datasets.
-    """
+    import logging
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    logger = logging.getLogger(__name__)
+    
     if RETRIEVER_CONFIG.get("hybrid") or RETRIEVER_CONFIG.get("sparse"):
-        print(f"[spaCy] Using: {SPACY_MODEL}")
+        logger.info(f"Using spaCy model: {SPACY_MODEL}")
 
     for dataset in DATASETS:
         for split in SPLITS:
             questions_path = processed_dataset_paths(dataset, split)["questions"]
             if not Path(questions_path).exists():
-                print(f"[skip] missing {dataset}/{split} questions: {questions_path}")
+                logger.warning(f"Skipping missing {dataset}/{split} questions: {questions_path}")
                 continue
             for retriever, enabled in RETRIEVER_CONFIG.items():
                 if not enabled:
@@ -742,8 +757,8 @@ def main() -> None:
                     for top_k_chunks in TOP_K_CHUNK_SWEEP:
                         for tau_low in TAU_LOW_SWEEP:
                             for seed in SEEDS:
-                                print(
-                                    f"\n[DA_EXIT] dataset={dataset} split={split} retriever={retriever} "
+                                logger.info(
+                                    f"Running DA_EXIT: dataset={dataset} split={split} retriever={retriever} "
                                     f"sentence_mode={sentence_mode} "
                                     f"top_k_chunks={top_k_chunks} tau_low={tau_low} seed={seed}"
                                 )

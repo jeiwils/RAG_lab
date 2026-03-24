@@ -10,7 +10,6 @@ from typing import Dict, List
 
 from tqdm import tqdm
 
-# Import the new configs and chunk_text functions
 from src.a2_indexing.chunking import ChunkingConfig, chunk_text as standard_chunk_text
 from src.a2_indexing.discourse_aware_chunking import (
     DiscourseAwareChunkingConfig,
@@ -79,7 +78,7 @@ ACORD_MAX_HARD_NEG = None
 ACORD_DROP_NO_POSITIVES = True
 
 ### RUN CONTROL
-RESUME = False
+RESUME = True
 
 ### VALIDATION SPLIT
 CARVE_VAL_SPLIT = True

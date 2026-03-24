@@ -16,7 +16,7 @@ def dataset_rep_paths(
 
     base = os.path.join("data", "representations", "datasets", dataset, split)
     suffix = ""
-    if passage_source and passage_source != "passages":
+    if passage_source:
         safe_source = passage_source.replace(os.sep, "_").replace("/", "_")
         base = os.path.join(base, safe_source)
         suffix = f"_{safe_source}"

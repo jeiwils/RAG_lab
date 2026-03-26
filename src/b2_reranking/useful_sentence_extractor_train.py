@@ -20,6 +20,7 @@ from src.b2_reranking.useful_sentence_extractor_infer import (
     encode_batch,
 )
 from src.utils.lora_helpers import (
+    apply_mode_kwargs,
     evaluate_and_choose_tau,
     find_attention_projection_modules,
     init_model_with_lora,
@@ -38,15 +39,32 @@ DEFAULT_DEV_SPLIT = "val"
 # Toggle to train on discourse-aware passages (passages_discourse_aware.jsonl).
 USE_DISCOURSE_AWARE_PASSAGES = False
 
+# Single switch for quick local smoke tests versus full training runs.
+TEST_MODE = True
+
+# Overrides applied only when TEST_MODE=True.
+TEST_MODE_KWARGS = {
+    "max_train_records": 64,
+    "max_dev_records": 32,
+    "hard_negatives": 1,
+    "random_negatives": 0,
+    "batch_size": 8,
+    "eval_batch_size": 64,
+    "max_length": 128,
+    "num_epochs": 1,
+    "warmup_steps": 0,
+}
+
 ### BASE MODEL SETTINGS
 # DEFAULT_MAX_LEN is imported from useful_sentence_extractor_infer.
 DEFAULT_BASE_MODEL = "microsoft/deberta-v3-base"
 DEFAULT_OUTPUT_DIR = "data/models/useful_sentence_lora"
 DEFAULT_OUTPUT_DIR_DISCOURSE_AWARE = "data/models/useful_sentence_lora_discourse_aware"
-DEFAULT_EVAL_BATCH_SIZE = 32
+DEFAULT_EVAL_BATCH_SIZE = 128
 DEFAULT_WD = 0.0
 DEFAULT_WARMUP = 200
 DEFAULT_MAX_GRAD_NORM = 1.0
+DEFAULT_TRAIN_MAX_LEN = 384 # only truncates an extremely small number of examples
 
 ### LORA/GRID SEARCH SETTINGS
 
@@ -167,6 +185,14 @@ def _run_explicit_grid(
     )
     return best
 
+
+def _get_precision_config(device: torch.device) -> tuple[torch.dtype, torch.dtype | None]:
+    if device.type != "cuda":
+        return torch.float32, None
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16, torch.bfloat16
+    return torch.float16, torch.float16
+
 def train(
     *,
     base_model_name: str = DEFAULT_BASE_MODEL,
@@ -193,7 +219,7 @@ def train(
     pos_weight: float | None = None,
     batch_size: int | None = None,
     eval_batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
-    max_length: int = DEFAULT_MAX_LEN,
+    max_length: int = DEFAULT_TRAIN_MAX_LEN,
     num_epochs: int | None = None,
     lr: float | None = None,
     lora_r: int | None = None,
@@ -205,6 +231,7 @@ def train(
     seed: int | None = DEFAULT_SEED,
     local_files_only: bool = LOCAL_FILES_ONLY,
     device: str | torch.device | None = None,
+    test_mode: bool = False,
 ):
 
     get_scheduler = get_linear_schedule_with_warmup
@@ -292,6 +319,10 @@ def train(
         neg = max(len(train_examples) - pos, 0)
         pos_weight = (neg / max(pos, 1)) if train_examples else 1.0
 
+    # Ultra-fast smoke path: keep weighting neutral to avoid extra variance from tiny sets.
+    if test_mode:
+        pos_weight = 1.0
+
     # Fast tokenizers trigger a hub lookup in some versions when offline.
     tokenizer = AutoTokenizer.from_pretrained(
         base_model_name,
@@ -301,21 +332,30 @@ def train(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
 
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
+    model_dtype, amp_dtype = _get_precision_config(device)
+
     model = init_model_with_lora(
         base_model_name,
         lora_r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
         local_files_only=local_files_only,
+        torch_dtype=model_dtype,
     )
 
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tokenizer.pad_token_id
 
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    device = torch.device(device)
     model.to(device)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_dtype == torch.float16)
+    weight_tensor = torch.tensor([pos_weight], device=device)
+
+    print(
+        f"[train] device={device} model_dtype={model_dtype} amp_dtype={amp_dtype}"
+    )
 
     optimiser = torch.optim.AdamW(
         params=_trainable_parameters(model),
@@ -345,8 +385,9 @@ def train(
             make_minibatches(
                 train_examples,
                 batch_size=batch_size,
-                shuffle=False,
-                seed=seed,
+                shuffle=True,
+                # Vary seed per epoch so each epoch sees a different order.
+                seed=None if seed is None else seed + epoch,
             ),
             total=steps_per_epoch or None,
             desc=f"epoch {epoch}",
@@ -359,27 +400,43 @@ def train(
             tokens = _move_to_device(tokens, device)
             labels = labels.to(device)
 
-            logits = model(**tokens).logits.squeeze(-1)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=amp_dtype is not None and device.type == "cuda",
+            ):
+                logits = model(**tokens).logits.squeeze(-1)
+                loss = F.binary_cross_entropy_with_logits(
+                    logits, labels, pos_weight=weight_tensor
+                )
             if not torch.isfinite(logits).all():
                 print(f"[warn] non-finite logits at epoch {epoch} step {steps + 1}")
                 optimiser.zero_grad()
                 continue
-            weight_tensor = torch.tensor([pos_weight], device=labels.device)
-            loss = F.binary_cross_entropy_with_logits(
-                logits, labels, pos_weight=weight_tensor
-            )
             if not torch.isfinite(loss):
                 print(f"[warn] non-finite loss at epoch {epoch} step {steps + 1}")
                 optimiser.zero_grad()
                 continue
 
-            loss.backward()
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimiser)
+            else:
+                loss.backward()
+
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             if not torch.isfinite(grad_norm):
                 print(f"[warn] non-finite grad norm at epoch {epoch} step {steps + 1}")
                 optimiser.zero_grad()
+                if scaler.is_enabled():
+                    scaler.update()
                 continue
-            optimiser.step()
+
+            if scaler.is_enabled():
+                scaler.step(optimiser)
+                scaler.update()
+            else:
+                optimiser.step()
             scheduler.step()
             optimiser.zero_grad()
 
@@ -395,18 +452,21 @@ def train(
             device=device,
             encode_batch_fn=encode_batch,
             encode_kwargs={"max_length": max_length},
+            include_confusion=True,
+            amp_dtype=amp_dtype,
             pos_weight=pos_weight,
         )
         metrics["epoch"] = epoch
         metrics["train_loss"] = avg_loss
 
-        save_checkpoint(
-            model,
-            tokenizer,
-            metrics,
-            output_dir=output_dir,
-            epoch=epoch,
-        )
+        if not test_mode:
+            save_checkpoint(
+                model,
+                tokenizer,
+                metrics,
+                output_dir=output_dir,
+                epoch=epoch,
+            )
 
         print(
             f"[epoch {epoch}] train_loss={avg_loss:.4f} "
@@ -414,35 +474,27 @@ def train(
             f"dev_f1={metrics['dev_f1']:.4f} tau={metrics['tau']:.3f}"
         )
 
-        if epoch == 1 or metrics["dev_loss"] < best_metrics["dev_loss"]:
+        is_better_f1 = metrics["dev_f1"] > best_metrics["dev_f1"]
+        is_tie_better_loss = (
+            metrics["dev_f1"] == best_metrics["dev_f1"]
+            and metrics["dev_loss"] < best_metrics["dev_loss"]
+        )
+        if epoch == 1 or is_better_f1 or is_tie_better_loss:
             best_metrics = metrics
-            best_with_confusion = evaluate_and_choose_tau(
-                model,
-                tokenizer,
-                dev_examples,
-                batch_size=eval_batch_size,
-                device=device,
-                encode_batch_fn=encode_batch,
-                encode_kwargs={"max_length": max_length},
-                pos_weight=pos_weight,
-                include_confusion=True,
-            )
-            best_with_confusion["epoch"] = epoch
-            best_with_confusion["train_loss"] = avg_loss
-            best_metrics = best_with_confusion
 
     best_path = Path(output_dir) / "best_metrics.json"
     with open(best_path, "wt", encoding="utf-8") as f:
         json.dump(best_metrics, f, indent=2)
-    try:
-        from src.tests.plot_confusion_matrix import plot_confusion
+    if not test_mode:
+        try:
+            from src.tests.plot_confusion_matrix import plot_confusion
 
-        plot_confusion(best_path, None)
-    except ModuleNotFoundError as exc:
-        if str(exc).startswith("No module named 'matplotlib'"):
-            print("[warn] matplotlib not installed; skipping confusion plot")
-        else:
-            raise
+            plot_confusion(best_path, None)
+        except ModuleNotFoundError as exc:
+            if str(exc).startswith("No module named 'matplotlib'"):
+                print("[warn] matplotlib not installed; skipping confusion plot")
+            else:
+                raise
     print(
         f"[best] epoch={best_metrics['epoch']} dev_loss={best_metrics['dev_loss']:.4f} "
         f"dev_f1={best_metrics['dev_f1']:.4f} tau={best_metrics['tau']:.3f}"
@@ -481,4 +533,14 @@ if __name__ == "__main__":
             grid_configs=GRID_CONFIGS,
         )
     else:
-        train(output_dir=output_dir, **train_kwargs, **BEST_GRID_RUN_KWARGS)
+        run_kwargs = apply_mode_kwargs(
+            BEST_GRID_RUN_KWARGS,
+            test_mode=TEST_MODE,
+            test_mode_kwargs=TEST_MODE_KWARGS,
+        )
+        train(
+            output_dir=output_dir,
+            test_mode=TEST_MODE,
+            **train_kwargs,
+            **run_kwargs,
+        )

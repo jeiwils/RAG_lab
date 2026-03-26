@@ -27,18 +27,22 @@ __all__ = [
     "select_ranked_sentences",
 ]
 
+# Sentence and query come first so they are never truncated; context is last
+# and absorbs any truncation when the chunk is long.
 DEFAULT_TEXT_TEMPLATE = (
     "Query:\n"
     "{query}\n"
-    "Full context:\n"
-    "{context}\n"
     "Sentence:\n"
     "{sentence}\n"
     "Is this sentence useful in answering the\n"
-    "query? Answer only \"Yes\" or \"No\""
+    "query given the following context? Answer only \"Yes\" or \"No\"\n"
+    "Context:\n"
+    "{context}"
 )
 
-DEFAULT_MAX_LEN = 256
+# DeBERTa-v3-base supports up to 512 tokens; 256 was too short and caused
+# the sentence to be truncated away when chunks were long.
+DEFAULT_MAX_LEN = 512
 LOCAL_FILES_ONLY = True
 
 _TOKEN_RE = re.compile(r"\S+")
@@ -154,12 +158,24 @@ def load_sentence_lora(checkpoint_dir: str, *, local_files_only: bool = True):
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token or tokenizer.unk_token
 
-    base = AutoModelForSequenceClassification.from_pretrained(
-        base_model_name,
-        num_labels=1,
-        use_safetensors=None,
-        local_files_only=local_files_only,
-    )
+    try:
+        # Force safetensors to avoid torch.load code paths blocked on torch<2.6.
+        base = AutoModelForSequenceClassification.from_pretrained(
+            base_model_name,
+            num_labels=1,
+            use_safetensors=True,
+            local_files_only=local_files_only,
+        )
+    except ValueError as e:
+        msg = str(e)
+        if "CVE-2025-32434" in msg or "upgrade torch to at least v2.6" in msg:
+            raise ValueError(
+                "Base model loading requires safetensors with current torch version, "
+                f"but safetensors were unavailable for '{base_model_name}'. "
+                "Either use a base checkpoint that ships safetensors, run with a "
+                "locally cached safetensors copy, or upgrade torch to >=2.6."
+            ) from e
+        raise
     model = PeftModel.from_pretrained(base, str(ckpt))
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tokenizer.pad_token_id
@@ -173,10 +189,11 @@ def score_sentences_lora(
     question: str,
     sentences: List[Dict[str, Any]],
     *,
-    checkpoint_dir: Path,
+    model: Any,              
+    tokenizer: Any,        
+    device: Any,         
     batch_size: int,
     max_length: int,
-    local_files_only: bool = LOCAL_FILES_ONLY,
 ) -> tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Score sentence candidates with the LoRA classifier and return token stats."""
     if not sentences:
@@ -190,14 +207,6 @@ def score_sentences_lora(
 
     if batch_size <= 0:
         raise ValueError("batch_size must be > 0")
-
-    try:
-        model, tokenizer, device = load_sentence_lora(
-            str(checkpoint_dir), local_files_only=local_files_only
-        )
-    except Exception as e:
-        logger.error(f"Failed to load LoRA model: {e}")
-        raise
 
     totals = {
         "sentence_prompt_tokens": 0,

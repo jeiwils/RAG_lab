@@ -14,9 +14,9 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Ensure deterministic CuBLAS when deterministic algorithms are enabled.
-# Must be set before CUDA is initialized.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import torch
 from tqdm import tqdm
@@ -31,6 +31,7 @@ from src.a2_indexing.retrieval_indexing import _retrieve_chunk_indices
 from src.b2_reranking.useful_sentence_extractor_infer import (
     DEFAULT_MAX_LEN,
     is_lora_checkpoint,
+    load_sentence_lora,
     score_sentences_lora,
     select_ranked_sentences,
 )
@@ -54,6 +55,7 @@ from src.utils.__utils__ import (
     processed_dataset_paths,
     save_jsonl,
 )
+from src.utils.token_budgeting import estimate_tokens
 
 __all__ = ["run_da_exit", "main"]
 
@@ -62,8 +64,8 @@ __all__ = ["run_da_exit", "main"]
 # ---------------------------------------------------------------------------
 
 ### DATA & SPLITS
-DATASETS = ["musique"] #["musique", "hotpotqa", "2wikimultihopqa", "natural_questions"]
-SPLITS = ["val", "dev"]
+DATASETS = ["musique"]
+SPLITS = ["dev"]
 
 ### RETRIEVAL & PASSAGE
 RETRIEVER_CONFIG = {
@@ -71,20 +73,22 @@ RETRIEVER_CONFIG = {
     "dense": False,
     "sparse": False,
 }
-TOP_K_CHUNK_SWEEP = [10, 5, 20, 1]
+TOP_K_CHUNK_SWEEP = [5, 10]
 HYBRID_ALPHA = DEFAULT_HYBRID_ALPHA 
-# Passage source (fixed chunk type).
+
 PASSAGE_SOURCE = "full_passages_chunks"
+
 # Sentence mode controls post-ranking expansion for the reader context.
 # "standard_sentences" = no expansion; "discourse_aware_sentences" = expand after ranking.
-SENTENCE_MODES = ["discourse_aware_sentences"] #["standard_sentences"] #["standard_sentences", "discourse_aware_sentences"]
+SENTENCE_MODES = ["standard_sentences", "discourse_aware_sentences"]
 
 ### SELECTION & BUDGETS
 # Sentence usefulness cutoff sweep (set from best_metrics.json of chosen LoRA model)
-TAU_LOW_SWEEP = [0.1, 0.15, 0.2, 0.25, 0.35]
+TAU_LOW_SWEEP = [0.35, 0.465, 0.58] # higher recall;  teacher chosen; higher precision
 # Total token budget for reader context (selected sentences).
-READER_CONTEXT_BUDGET_TOKENS = 800
 
+# Sweep different reader context budgets to evaluate discourse-aware efficiency
+READER_CONTEXT_BUDGET_TOKENS_SWEEP = [256, 384, 512]
 ### READER
 READER_MODEL = "Mistral/Mistral-7B-Instruct-v0.1.Q4_0.gguf" 
 SERVER_URL = "http://localhost:8005"
@@ -93,7 +97,7 @@ IN_PROCESS_READER_LOCAL_FILES_ONLY = True
 
 ### LORA / RERANKER
 SENTENCE_GRADER_MODEL = (
-    "data/models/useful_sentence_lora/grid/"
+    "data/models/useful_sentence_lora/"
     "checkpoint-epoch2"
 )
 SENTENCE_LORA_BATCH_SIZE = 32
@@ -101,7 +105,7 @@ SENTENCE_LORA_MAX_LEN = DEFAULT_MAX_LEN
 SENTENCE_LORA_LOCAL_FILES_ONLY = True
 
 ### RUN CONTROL
-SEEDS = [1, 2, 3] # [1] #
+SEEDS = [1, 2, 3]
 MAX_QUESTIONS: int | None = 100  # set to None to use the full split
 SHUFFLE_QUESTIONS = False
 RESUME = True
@@ -125,7 +129,9 @@ def run_da_exit(
     seed: int | None,
     resume: bool,
     tau_low: float,
-) -> Dict[str, Any]:
+    reader_context_budget_tokens: int,
+    show_query_progress: bool = True,
+    ) -> Dict[str, Any]:
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
@@ -187,9 +193,14 @@ def run_da_exit(
         logger.warning(f"No questions found in {questions_path}")
         return {}
 
+    logger.info(f"Loading sentence grader model from {sentence_model}...")
+    grader_model, grader_tokenizer, grader_device = load_sentence_lora(
+        checkpoint_dir=Path(sentence_model),
+        local_files_only=SENTENCE_LORA_LOCAL_FILES_ONLY,
+    )
     method_prefix = "exit" if sentence_mode == "standard_sentences" else "da_exit"
     tau_tag = f"tau{tau_low}".replace(".", "p")
-    variant = f"{method_prefix}_{retriever}_k{top_k_chunks}_{tau_tag}"
+    variant = f"{method_prefix}_{retriever}_k{top_k_chunks}_{tau_tag}_b{reader_context_budget_tokens}"
     if seed is not None:
         variant = f"{variant}_seed{seed}"
     paths = get_result_paths(reader_model, dataset, split, variant)
@@ -212,7 +223,7 @@ def run_da_exit(
     )
 
     predictions: Dict[str, str] = {}
-    gold: Dict[str, List[str]] = {}
+    gold_all: Dict[str, List[str]] = {}
     wall_times: List[float] = []
     reader_wall_times: List[float] = []
 
@@ -230,24 +241,33 @@ def run_da_exit(
     recall_at_k_scores: List[float] = []
     precision_at_k_scores: List[float] = []
 
-    for q in tqdm(questions, desc=f"{dataset}/{split}/{retriever}"):
+    question_iter = (
+        tqdm(questions, desc=f"{dataset}/{split}/{retriever}")
+        if show_query_progress
+        else questions
+    )
+    for q in question_iter:
         q_id = q.get("question_id")
         if not q_id:
             logger.warning("Question missing question_id, skipping")
             continue
+        gold_all[q_id] = [q.get("gold_answer", "")]
         if resume and q_id in done_ids:
             continue
         q_text = q.get("question", "").strip()
         if not q_text:
             logger.warning(f"Question {q_id} has no text, skipping")
             continue
-        gold[q_id] = [q.get("gold_answer", "")]
 
         def _run_query():
             """Execute retrieval, sentence scoring, and reader inference for one query."""
             query_vec = None
             if retriever in {"dense", "hybrid"} and encoder is not None:
-                query_vec = encoder.encode([q_text], normalize_embeddings=False)
+                query_vec = encoder.encode(
+                    [q_text],
+                    normalize_embeddings=False,
+                    show_progress_bar=False,
+                )
             chunk_idxs = _retrieve_chunk_indices(
                 retriever,
                 q_text,
@@ -296,6 +316,7 @@ def run_da_exit(
                 n_candidates: Optional[int] = None,
                 n_ranked: Optional[int] = None,
                 n_filtered: Optional[int] = None,
+                reader_budget: Optional[Dict[str, Any]] = None,
             ) -> None:
                 def _pack_sentence(s: Dict[str, Any]) -> Dict[str, Any]:
                     return {
@@ -322,7 +343,7 @@ def run_da_exit(
                     "question_id": q_id,
                     "question": q_text,
                     "tau_low": tau_low,
-                    "token_budget": READER_CONTEXT_BUDGET_TOKENS,
+                    "token_budget": reader_context_budget_tokens,
                     "top_k_chunks": top_k_chunks,
                     "retrieved_chunk_count": len(chunk_ids),
                     "retrieved_chunk_ids": chunk_ids,
@@ -337,6 +358,8 @@ def run_da_exit(
                     payload["n_ranked"] = n_ranked
                 if n_filtered is not None:
                     payload["n_filtered"] = n_filtered
+                if reader_budget is not None:
+                    payload["reader_budget"] = reader_budget
                 append_jsonl(str(debug_path), payload)
 
             if not sentences:
@@ -368,20 +391,23 @@ def run_da_exit(
             scored, sentence_tokens = score_sentences_lora(
                 q_text,
                 sentences,
-                checkpoint_dir=Path(sentence_model),
+                model=grader_model,         
+                tokenizer=grader_tokenizer, 
+                device=grader_device,       
                 batch_size=SENTENCE_LORA_BATCH_SIZE,
                 max_length=SENTENCE_LORA_MAX_LEN,
-                local_files_only=SENTENCE_LORA_LOCAL_FILES_ONLY,
             )
 
             """Ranking: _select_top_sentences(scored, top_k=len(scored)) sorts by score (highest first)."""
             ranked = _select_top_sentences(scored, top_k=len(scored))
+            reader_count_tokens = lambda text: estimate_tokens(text, reader_model)
 
             """Repackaging with tau + budget: select_ranked_sentences(..., tau_low=TAU_LOW, token_budget=READER_CONTEXT_BUDGET_TOKENS) keeps only above tau and within the budget, preserving rank order."""
             filtered = select_ranked_sentences(
                 ranked,
-                token_budget=READER_CONTEXT_BUDGET_TOKENS,
+                token_budget=reader_context_budget_tokens,
                 tau_low=tau_low,
+                count_tokens_fn=reader_count_tokens,
             )
             selected = filtered
             if expand_after:
@@ -404,8 +430,9 @@ def run_da_exit(
                 # Re-apply token budget after expansion, preserving rank order.
                 expanded_selected = select_ranked_sentences(
                     expanded_selected,
-                    token_budget=READER_CONTEXT_BUDGET_TOKENS,
+                    token_budget=reader_context_budget_tokens,
                     tau_low=None,
+                    count_tokens_fn=reader_count_tokens,
                 )
                 selected = expanded_selected
             if not selected:
@@ -434,12 +461,6 @@ def run_da_exit(
             sentence_ids = list(sentence_lookup.keys())
 
             """Sent to reader: the ordered selected list is passed through ask_llm_with_passages in that same order."""
-            _write_reader_debug(
-                selected,
-                n_candidates=len(sentences),
-                n_ranked=len(ranked),
-                n_filtered=len(filtered),
-            )
             answer, reader_wall_time_sec = wall_time(
                 ask_llm_with_passages,
                 query_text=q_text,
@@ -452,6 +473,28 @@ def run_da_exit(
                 seed=seed,
                 in_process=USE_IN_PROCESS_READER,
                 local_files_only=IN_PROCESS_READER_LOCAL_FILES_ONLY,
+            )
+
+            reader_budget = {
+                "context_window_tokens": answer.get("budget_context_window_tokens"),
+                "reserved_output_tokens": answer.get("budget_reserved_output_tokens"),
+                "safety_margin_tokens": answer.get("budget_safety_margin_tokens"),
+                "prompt_budget_tokens": answer.get("budget_prompt_tokens"),
+                "base_prompt_tokens": answer.get("budget_base_prompt_tokens"),
+                "context_budget_tokens": answer.get("budget_context_tokens"),
+                "max_passage_tokens": answer.get("budget_max_passage_tokens"),
+                "n_candidate_passages": answer.get("budget_n_candidate_passages"),
+                "n_selected_passages": answer.get("budget_n_selected_passages"),
+                "n_dropped_passages": answer.get("budget_n_dropped_passages"),
+                "n_truncated_passages": answer.get("budget_n_truncated_passages"),
+                "used_context_tokens": answer.get("budget_used_context_tokens"),
+            }
+            _write_reader_debug(
+                selected,
+                n_candidates=len(sentences),
+                n_ranked=len(ranked),
+                n_filtered=len(filtered),
+                reader_budget=reader_budget,
             )
 
             return {
@@ -578,6 +621,20 @@ def run_da_exit(
                 "reader_prompt_tokens": answer.get("prompt_len", 0),
                 "reader_output_tokens": answer.get("output_tokens", 0),
                 "reader_total_tokens": answer.get("total_tokens", 0),
+                "reader_budget": {
+                    "context_window_tokens": answer.get("budget_context_window_tokens"),
+                    "reserved_output_tokens": answer.get("budget_reserved_output_tokens"),
+                    "safety_margin_tokens": answer.get("budget_safety_margin_tokens"),
+                    "prompt_budget_tokens": answer.get("budget_prompt_tokens"),
+                    "base_prompt_tokens": answer.get("budget_base_prompt_tokens"),
+                    "context_budget_tokens": answer.get("budget_context_tokens"),
+                    "max_passage_tokens": answer.get("budget_max_passage_tokens"),
+                    "n_candidate_passages": answer.get("budget_n_candidate_passages"),
+                    "n_selected_passages": answer.get("budget_n_selected_passages"),
+                    "n_dropped_passages": answer.get("budget_n_dropped_passages"),
+                    "n_truncated_passages": answer.get("budget_n_truncated_passages"),
+                    "used_context_tokens": answer.get("budget_used_context_tokens"),
+                },
                 "wall_time_sec": round(query_wall_sec, 4),
                 "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             },
@@ -585,12 +642,27 @@ def run_da_exit(
 
         predictions[q_id] = answer.get("normalised_answer", "")
 
-    if not predictions:
-        print("No new queries processed.")
+    eval_predictions = dict(predictions)
+    if resume and paths["answers"].exists():
+        for row in load_jsonl(str(paths["answers"])):
+            qid = row.get("question_id")
+            if not qid:
+                continue
+            if qid in eval_predictions:
+                continue
+            eval_predictions[qid] = str(row.get("normalised_answer", ""))
+
+    if not eval_predictions:
+        print("No query predictions available.")
         return {}
 
-    per_query = evaluate_answers(predictions, gold)
-    agg_scores = aggregate_answer_scores(predictions, gold)
+    eval_gold = {qid: gold_all[qid] for qid in eval_predictions if qid in gold_all}
+    if not eval_gold:
+        print("No gold answers available for evaluated predictions.")
+        return {}
+
+    per_query = evaluate_answers(eval_predictions, eval_gold)
+    agg_scores = aggregate_answer_scores(eval_predictions, eval_gold)
 
     metric_records = [
         {
@@ -605,11 +677,7 @@ def run_da_exit(
         }
         for qid, m in per_query.items()
     ]
-    if resume and paths["answer_metrics"].exists():
-        for rec in metric_records:
-            append_jsonl(str(paths["answer_metrics"]), rec)
-    else:
-        save_jsonl(str(paths["answer_metrics"]), metric_records)
+    save_jsonl(str(paths["answer_metrics"]), metric_records)
 
     wall_time_sec_total = sum(wall_times)
     wall_time_sec_mean = (
@@ -739,11 +807,18 @@ def run_da_exit(
 def main() -> None:
     import logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    # Keep pipeline logs at INFO while silencing noisy dependency internals.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+    logging.getLogger("huggingface_hub.utils._http").setLevel(logging.ERROR)
     logger = logging.getLogger(__name__)
     
     if RETRIEVER_CONFIG.get("hybrid") or RETRIEVER_CONFIG.get("sparse"):
         logger.info(f"Using spaCy model: {SPACY_MODEL}")
 
+    run_specs: List[Dict[str, Any]] = []
     for dataset in DATASETS:
         for split in SPLITS:
             questions_path = processed_dataset_paths(dataset, split)["questions"]
@@ -757,25 +832,49 @@ def main() -> None:
                     for top_k_chunks in TOP_K_CHUNK_SWEEP:
                         for tau_low in TAU_LOW_SWEEP:
                             for seed in SEEDS:
-                                logger.info(
-                                    f"Running DA_EXIT: dataset={dataset} split={split} retriever={retriever} "
-                                    f"sentence_mode={sentence_mode} "
-                                    f"top_k_chunks={top_k_chunks} tau_low={tau_low} seed={seed}"
-                                )
-                                run_da_exit(
-                                    dataset=dataset,
-                                    split=split,
-                                    retriever=retriever,
-                                    reader_model=READER_MODEL,
-                                    sentence_model=SENTENCE_GRADER_MODEL,
-                                    server_url=SERVER_URL,
-                                    top_k_chunks=top_k_chunks,
-                                    sentence_mode=sentence_mode,
-                                    seed=seed,
-                                    resume=RESUME,
-                                    tau_low=tau_low,
-                                )
+                                for reader_context_budget_tokens in READER_CONTEXT_BUDGET_TOKENS_SWEEP:
+                                    run_specs.append(
+                                        {
+                                            "dataset": dataset,
+                                            "split": split,
+                                            "retriever": retriever,
+                                            "sentence_mode": sentence_mode,
+                                            "top_k_chunks": top_k_chunks,
+                                            "tau_low": tau_low,
+                                            "seed": seed,
+                                            "reader_context_budget_tokens": reader_context_budget_tokens,
+                                        }
+                                    )
 
+    if not run_specs:
+        logger.warning("No runnable DA_EXIT configurations found.")
+        return
+
+    with tqdm(total=len(run_specs), desc="DA_EXIT runs", unit="run") as run_pbar:
+        for spec in run_specs:
+            logger.info(
+                f"Running DA_EXIT: dataset={spec['dataset']} split={spec['split']} retriever={spec['retriever']} "
+                f"sentence_mode={spec['sentence_mode']} "
+                f"top_k_chunks={spec['top_k_chunks']} tau_low={spec['tau_low']} "
+                f"budget={spec['reader_context_budget_tokens']} seed={spec['seed']}"
+            )
+
+            run_da_exit(
+                dataset=spec["dataset"],
+                split=spec["split"],
+                retriever=spec["retriever"],
+                reader_model=READER_MODEL,
+                sentence_model=SENTENCE_GRADER_MODEL,
+                server_url=SERVER_URL,
+                top_k_chunks=spec["top_k_chunks"],
+                sentence_mode=spec["sentence_mode"],
+                seed=spec["seed"],
+                resume=RESUME,
+                tau_low=spec["tau_low"],
+                reader_context_budget_tokens=spec["reader_context_budget_tokens"],
+                show_query_progress=False,
+            )
+            run_pbar.update(1)
 
 if __name__ == "__main__":
     main()

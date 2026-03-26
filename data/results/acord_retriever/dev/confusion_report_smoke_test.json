@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "dataset": "acord",
+    "split": "dev",
+    "model_checkpoint": null,
+    "scoring_mode": "token_overlap",
+    "run_tag": "smoke_test",
+    "near_miss_path": "data\\raw_datasets\\ACORD\\near_miss.yaml",
+    "pos_threshold": 3,
+    "top_k": 5,
+    "timestamp": "2026-03-24T17:26:47"
+  },
+  "overall": {
+    "queries_total": 6,
+    "mean_ndcg": 0.657189,
+    "mean_ndcg_at_k": 0.435359,
+    "ccr_docs": 0.033333,
+    "ccr_queries": 0.166667,
+    "confused_hits": 1,
+    "total_top_k": 30,
+    "missing_docs": 0
+  },
+  "pair_confusion": [
+    {
+      "query_id": "first party indemnification of broad-based claims",
+      "near_miss_id": "first party indemnification of specified claims",
+      "hits": 1,
+      "hit_rate": 0.2
+    }
+  ],
+  "query_confusion_samples": [
+    {
+      "query_id": "first party indemnification of broad-based claims",
+      "query": "first party indemnification of broad-based claims",
+      "confused_hits": 1,
+      "confused_doc_ids": [
+        "7d672b1476"
+      ]
+    }
+  ]
+}

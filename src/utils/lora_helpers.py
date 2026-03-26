@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Sequence, TypeVar
 
 import torch
 from peft import LoraConfig, TaskType, get_peft_model
+from tqdm import tqdm
 from transformers import AutoModelForSequenceClassification
 
 from src.d1_evaluation.classification_metrics import binary_f1
@@ -19,6 +20,7 @@ __all__ = [
     "DEFAULT_TAU_MAX",
     "DEFAULT_TAU_STEPS",
     "DEFAULT_PRECISION_TARGET",
+    "apply_mode_kwargs",
     "evaluate_and_choose_tau",
     "find_attention_projection_modules",
     "init_model_with_lora",
@@ -37,6 +39,27 @@ DEFAULT_TAU_MIN = 0.3
 DEFAULT_TAU_MAX = 0.9
 DEFAULT_TAU_STEPS = 81
 DEFAULT_PRECISION_TARGET = 0.80
+
+
+def apply_mode_kwargs(
+    base_kwargs: Dict[str, Any],
+    *,
+    test_mode: bool,
+    test_mode_kwargs: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """
+    Return merged run kwargs with optional test-mode overrides.
+    to use, define local:
+    - TEST_MODE boolean
+    - TEST_MODE_KWARGS dict of kwargs to override when TEST_MODE is True
+    - then wrap run kwargs in this helper  
+    
+    
+    """
+    merged = dict(base_kwargs)
+    if test_mode and test_mode_kwargs:
+        merged.update(test_mode_kwargs)
+    return merged
 
 
 def find_attention_projection_modules(model) -> List[str]:
@@ -226,6 +249,7 @@ def evaluate_and_choose_tau(
     encode_kwargs: Dict[str, Any] | None = None,
     thresholds: torch.Tensor | None = None,
     include_confusion: bool = False,
+    amp_dtype: torch.dtype | None = None,
     pos_weight: float | None = None,
     precision_target: float | None = None,
 ):
@@ -251,12 +275,22 @@ def evaluate_and_choose_tau(
     model.eval()
     all_logits: List[torch.Tensor] = []
     all_labels: List[torch.Tensor] = []
+    total_batches = math.ceil(len(dev_examples) / batch_size) if dev_examples else 0
 
     with torch.no_grad():
-        for batch in make_minibatches(dev_examples, batch_size=batch_size, shuffle=False):
+        for batch in tqdm(
+            make_minibatches(dev_examples, batch_size=batch_size, shuffle=False),
+            total=total_batches or None,
+            desc="eval",
+        ):
             tokens, labels = encode_batch_fn(tokenizer, batch, **encode_kwargs)
             tokens = move_to_device(tokens, device)
-            logits = model(**tokens).logits.squeeze(-1)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=amp_dtype is not None and device.type == "cuda",
+            ):
+                logits = model(**tokens).logits.squeeze(-1)
             all_logits.append(logits.detach().cpu())
             all_labels.append(labels.detach().cpu())
 

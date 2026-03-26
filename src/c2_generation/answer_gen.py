@@ -3,21 +3,24 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from functools import lru_cache
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-try:  # optional dependency
-    import tiktoken  # type: ignore
-except Exception:  # pragma: no cover - fallback when tiktoken missing
-    tiktoken = None  # type: ignore
-
 from src.d1_evaluation.answer_metrics import normalise_answer
+from src.utils.token_budgeting import (
+    DEFAULT_CONTEXT_SAFETY_MARGIN,
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
+    DEFAULT_MAX_PASSAGE_TOKENS,
+    ReaderBudgetPolicy,
+    compute_reader_budget,
+    estimate_tokens,
+    pack_passages_to_budget,
+)
 from src.utils.x_config import MAX_TOKENS, TEMPERATURE
 
 logger = logging.getLogger(__name__)
@@ -32,9 +35,7 @@ __all__ = [
 ]
 
 ### DEFAULTS
-DEFAULT_MAX_CONTEXT_TOKENS = int(os.environ.get("LLM_CONTEXT_WINDOW", "4096"))
-DEFAULT_CONTEXT_SAFETY_MARGIN = int(os.environ.get("LLM_CONTEXT_SAFETY_MARGIN", "128"))
-DEFAULT_MAX_PASSAGE_TOKENS = int(os.environ.get("MAX_PASSAGE_TOKENS", "512"))
+DEFAULT_MAX_CONTEXT_TOKENS = DEFAULT_CONTEXT_WINDOW_TOKENS
 BASE_PROMPT_TEMPLATE = (
     "Context information is below.\n"
     "-----------------------\n"
@@ -46,27 +47,6 @@ BASE_PROMPT_TEMPLATE = (
     "Answer:"
 )
 
-
-@lru_cache(maxsize=4)
-def _get_encoding(model_name: str):
-    if tiktoken is None:
-        return None
-    try:
-        return tiktoken.encoding_for_model(model_name)
-    except Exception:
-        return tiktoken.get_encoding("cl100k_base")
-
-
-def _estimate_tokens(text: str, model_name: str) -> int:
-    if not text:
-        return 0
-    enc = _get_encoding(model_name)
-    if enc is not None:
-        return len(enc.encode(text))
-    # Rough fallback: inflate word count to reduce risk of exceeding context.
-    return int(len(text.split()) * 1.3) + 1
-
-
 def compute_max_context_tokens(
     query_text: str,
     model_name: str,
@@ -77,7 +57,7 @@ def compute_max_context_tokens(
     if context_budget_tokens <= 0:
         return 0
     base_prompt = BASE_PROMPT_TEMPLATE.format(context="", query_text=query_text)
-    base_tokens = _estimate_tokens(base_prompt, model_name)
+    base_tokens = estimate_tokens(base_prompt, model_name)
     reserved_for_output = min(max_output_tokens, 256)
     return (
         context_budget_tokens
@@ -85,22 +65,6 @@ def compute_max_context_tokens(
         + reserved_for_output
         + DEFAULT_CONTEXT_SAFETY_MARGIN
     )
-
-
-def _truncate_to_token_budget(text: str, budget: int, model_name: str) -> str:
-    if budget <= 0 or not text:
-        return ""
-    enc = _get_encoding(model_name)
-    if enc is not None:
-        tokens = enc.encode(text)
-        if len(tokens) <= budget:
-            return text
-        return enc.decode(tokens[:budget]).strip()
-    words = text.split()
-    if len(words) <= budget:
-        return text
-    return " ".join(words[:budget]).strip()
-
 
 def extract_final_answer(raw: str) -> str:
     """Extract the last stated answer from raw LLM output."""
@@ -170,7 +134,7 @@ def ask_llm_with_passages(
     *,
     in_process: bool = False,
     local_files_only: bool = True,
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     """Generate an answer from top passages using an LLM server."""
     if not query_text.strip() or not passage_ids:
         logger.warning("Empty query or passage_ids; returning empty answer")
@@ -201,36 +165,26 @@ def ask_llm_with_passages(
         query_text=query_text,
     )
 
-    context_window = max_context_tokens or DEFAULT_MAX_CONTEXT_TOKENS
-    passage_token_cap = (
+    policy = ReaderBudgetPolicy(
+        context_window_tokens=max_context_tokens or DEFAULT_MAX_CONTEXT_TOKENS,
+        safety_margin_tokens=DEFAULT_CONTEXT_SAFETY_MARGIN,
+        max_passage_tokens=(
         DEFAULT_MAX_PASSAGE_TOKENS if max_passage_tokens is None else max_passage_tokens
+        ),
     )
-    reserved_for_output = min(max_tokens, 256)
-    prompt_budget = max(
-        0, context_window - reserved_for_output - DEFAULT_CONTEXT_SAFETY_MARGIN
+    budget_info = compute_reader_budget(
+        policy=policy,
+        base_prompt_tokens=estimate_tokens(base_prompt.format(context=""), model_name),
+        max_output_tokens=max_tokens,
     )
-    base_tokens = _estimate_tokens(base_prompt.format(context=""), model_name)
-    context_budget = max(prompt_budget - base_tokens, 0)
 
-    selected_passages: List[str] = []
-    used_tokens = 0
-    for passage in passage_texts:
-        text = passage.strip()
-        if not text:
-            continue
-        if passage_token_cap is not None and passage_token_cap > 0:
-            text = _truncate_to_token_budget(text, passage_token_cap, model_name)
-        est_tokens = _estimate_tokens(text, model_name)
-        sep_tokens = 2
-        if used_tokens + est_tokens + sep_tokens > context_budget:
-            remaining = context_budget - used_tokens - sep_tokens
-            if not selected_passages and remaining > 0:
-                trimmed = _truncate_to_token_budget(text, remaining, model_name)
-                if trimmed:
-                    selected_passages.append(trimmed)
-            break
-        selected_passages.append(text)
-        used_tokens += est_tokens + sep_tokens
+    selected_passages, packing_stats = pack_passages_to_budget(
+        passage_texts,
+        model_name=model_name,
+        context_budget_tokens=budget_info["context_budget_tokens"],
+        max_passage_tokens=policy.max_passage_tokens,
+        separator_tokens=policy.separator_tokens,
+    )
 
     prompt = base_prompt.format(context="\n\n".join(selected_passages))
 
@@ -296,6 +250,20 @@ def ask_llm_with_passages(
         "prompt_len": prompt_tokens,
         "output_tokens": completion_tokens,
         "total_tokens": total_tokens,
+        "budget_context_window_tokens": budget_info["context_window_tokens"],
+        "budget_reserved_output_tokens": budget_info["reserved_for_output_tokens"],
+        "budget_safety_margin_tokens": budget_info["safety_margin_tokens"],
+        "budget_prompt_tokens": budget_info["prompt_budget_tokens"],
+        "budget_base_prompt_tokens": budget_info["base_prompt_tokens"],
+        "budget_context_tokens": budget_info["context_budget_tokens"],
+        "budget_max_passage_tokens": (
+            -1 if policy.max_passage_tokens is None else int(policy.max_passage_tokens)
+        ),
+        "budget_n_candidate_passages": packing_stats["n_candidate_passages"],
+        "budget_n_selected_passages": packing_stats["n_selected_passages"],
+        "budget_n_dropped_passages": packing_stats["n_dropped_passages"],
+        "budget_n_truncated_passages": packing_stats["n_truncated_passages"],
+        "budget_used_context_tokens": packing_stats["used_context_tokens"],
     }
 
 
